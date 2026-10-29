@@ -75,6 +75,11 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 	if err := e.validateDraft(item.Type, input.Fields); err != nil {
 		return nil, err
 	}
+	if e.guardsDraftSize(item.Type) {
+		if err := validateDraftSize(input.Fields); err != nil {
+			return nil, err
+		}
+	}
 
 	now := time.Now().UTC()
 	schema, _ := e.schemas.schemaFor(item.Type)
@@ -120,12 +125,21 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 	// Resolve the (immutable) content type and enforce the create/update guards. This read
 	// is safe under concurrency — an item's type never changes — and the write below is a
 	// targeted atomic merge, so simultaneous per-field writes do not clobber each other.
-	contentType, err := e.fieldWriteType(ctx, input)
+	contentType, existing, err := e.fieldWriteType(ctx, input)
 	if err != nil {
 		return nil, err
 	}
 	if err := e.validateField(contentType, input.FieldID, input.Locale, input.Value); err != nil {
 		return nil, err
+	}
+	if e.guardsDraftSize(contentType) {
+		var draftFields ContentFields
+		if existing != nil && existing.Draft != nil {
+			draftFields = existing.Draft.Fields
+		}
+		if err := validateDraftSize(withFieldValue(draftFields, input.FieldID, input.Locale, input.Value)); err != nil {
+			return nil, err
+		}
 	}
 
 	schema, _ := e.schemas.schemaFor(contentType)
@@ -152,31 +166,32 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 }
 
 // fieldWriteType resolves the content type a SetFieldValue writes against, enforcing that
-// an existing item's type is immutable and that a create carries a key + known type.
-func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (ContentType, error) {
+// an existing item's type is immutable and that a create carries a key + known type. It
+// also returns the existing item (nil on create).
+func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (ContentType, *ContentItem, error) {
 	existing, err := e.resolveExisting(ctx, input.Match)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if existing != nil {
 		if err := rejectArchived(existing); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if input.Type != "" && input.Type != existing.Type {
-			return "", badRequest("item type cannot change")
+			return "", nil, badRequest("item type cannot change")
 		}
-		return existing.Type, nil
+		return existing.Type, existing, nil
 	}
 	if input.Match.Key == "" {
-		return "", badRequest("key is required to create a new item")
+		return "", nil, badRequest("key is required to create a new item")
 	}
 	if input.Type == "" {
-		return "", badRequest("type is required to create a new item")
+		return "", nil, badRequest("type is required to create a new item")
 	}
 	if _, ok := e.schemas.schemaFor(input.Type); !ok {
-		return "", badRequest(fmt.Sprintf("unknown content type %q", input.Type))
+		return "", nil, badRequest(fmt.Sprintf("unknown content type %q", input.Type))
 	}
-	return input.Type, nil
+	return input.Type, nil, nil
 }
 
 // Publish copies the current draft snapshot into the published snapshot.
