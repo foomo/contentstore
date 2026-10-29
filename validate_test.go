@@ -209,3 +209,20 @@ func TestDraftSizeGuard(t *testing.T) {
 		t.Fatalf("shrinking a value rejected: %v", err)
 	}
 }
+
+func TestPublishRechecksDraftSize(t *testing.T) {
+	ctx := context.Background()
+	e := largeDocEngine()
+	store := e.store.(*fakeStore)
+	big := strings.Repeat("a", 1_900_000)
+	// A draft that outgrew the guard through concurrent SetFieldValue calls.
+	store.items["doc"] = &ContentItem{ID: "doc", Type: "largeDoc", Draft: &ContentSnapshot{
+		Revision: 4,
+		Fields:   mkFields(map[string]map[string]any{"a": {"de": big}, "b": {"de": big}, "c": {"de": big}, "d": {"de": big}}),
+	}}
+	_, err := e.Publish(ctx, ContentItemMatch{ID: "doc"})
+	wantKind(t, err, KindBadRequest)
+	if store.items["doc"].Published != nil {
+		t.Fatal("an oversized draft must not be published")
+	}
+}

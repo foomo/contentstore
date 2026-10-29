@@ -71,11 +71,7 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 	if input.ExpectedRevision != nil && *input.ExpectedRevision < 0 {
 		return nil, badRequest("expectedRevision must not be negative")
 	}
-	placed := input.ParentID != "" || input.Name != ""
-	if placed && input.Type != "" && !e.schemas.isTreeType(input.Type) {
-		return nil, notInTree(input.Type)
-	}
-	if placed || e.schemas.isTreeType(input.Type) {
+	if input.ParentID != "" || input.Name != "" || e.schemas.isTreeType(input.Type) {
 		return e.saveTreeDraft(ctx, input)
 	}
 
@@ -191,6 +187,9 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 		if errors.Is(err, ErrNotFound) {
 			return nil, notFound("item not found")
 		}
+		if errors.Is(err, ErrConflict) {
+			return nil, conflict("key is taken by an item of another type")
+		}
 		return nil, internalErr(err, "set field value failed")
 	}
 	e.emit(item, OpSaveDraft)
@@ -228,15 +227,7 @@ func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (
 
 // Publish copies the current draft snapshot into the published snapshot.
 func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
-	if err != nil {
-		return nil, err
-	}
-	if e.onTree(item) {
-		item, err = e.treeWrite(ctx, match, e.publish)
-	} else {
-		err = e.publish(ctx, item)
-	}
+	item, err := e.write(ctx, match, e.publish)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +244,13 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 	}
 	if err := e.validatePublish(item.Type, item.Draft.Fields); err != nil {
 		return err
+	}
+	// Concurrent SetFieldValue calls are checked against the draft each one read, so
+	// together they can outgrow the guard; publishing would then exceed the document size.
+	if e.guardsDraftSize(item.Type) {
+		if err := validateDraftSize(item.Draft.Fields); err != nil {
+			return err
+		}
 	}
 
 	now := time.Now().UTC()
@@ -278,20 +276,11 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 // left alone (and emits nothing) rather than rejected, so bulk callers can apply it to a
 // mixed selection. Unpublishing a tree container hides its subtree from the published view.
 func (e *Engine) Unpublish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
-	if err != nil {
-		return nil, err
-	}
 	var changed bool
-	unpublish := func(ctx context.Context, item *ContentItem) (err error) {
+	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) (err error) {
 		changed, err = e.unpublish(ctx, item)
 		return err
-	}
-	if e.onTree(item) {
-		item, err = e.treeWrite(ctx, match, unpublish)
-	} else {
-		err = unpublish(ctx, item)
-	}
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -333,20 +322,14 @@ func rejectArchived(item *ContentItem) error {
 // Archive hides an item while keeping both snapshots. A tree item can only be archived
 // once all its children are.
 func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
-	if err != nil {
-		return nil, err
-	}
-	if e.onTree(item) {
-		item, err = e.treeWrite(ctx, match, func(ctx context.Context, item *ContentItem) error {
+	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) error {
+		if e.onTree(item) {
 			if err := e.rejectChildren(ctx, item, ChildrenLive, "archive its children first"); err != nil {
 				return err
 			}
-			return e.archive(ctx, item)
-		})
-	} else {
-		err = e.archive(ctx, item)
-	}
+		}
+		return e.archive(ctx, item)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -370,20 +353,14 @@ func (e *Engine) archive(ctx context.Context, item *ContentItem) error {
 // content is lost; re-publish to make it live again. A tree item can only be unarchived
 // while its parent is not archived.
 func (e *Engine) Unarchive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
-	if err != nil {
-		return nil, err
-	}
-	if e.onTree(item) {
-		item, err = e.treeWrite(ctx, match, func(ctx context.Context, item *ContentItem) error {
+	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) error {
+		if e.onTree(item) {
 			if err := e.rejectArchivedParent(ctx, item); err != nil {
 				return err
 			}
-			return e.unarchive(ctx, item)
-		})
-	} else {
-		err = e.unarchive(ctx, item)
-	}
+		}
+		return e.unarchive(ctx, item)
+	})
 	if err != nil {
 		return nil, err
 	}

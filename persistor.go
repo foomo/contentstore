@@ -277,6 +277,10 @@ func (p *Persistor) SetField(ctx context.Context, in FieldUpdate) (*ContentItem,
 		// Lost a concurrent create race on the same key: the document now exists, so a
 		// single retry resolves to it and applies the field update instead of inserting.
 		err = p.coll.FindOneAndUpdate(ctx, filter, update, opts).Decode(item)
+		if mongo.IsDuplicateKeyError(err) {
+			// The key is held by an item of another type.
+			return nil, ErrConflict
+		}
 	}
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {

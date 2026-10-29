@@ -170,7 +170,7 @@ func (f *fakeStore) SetField(_ context.Context, in FieldUpdate) (*ContentItem, e
 				// The persistor's key upsert also matches the type; a key held by another
 				// type makes its insert fail on the unique key index.
 				if it.Type != in.Type {
-					return nil, fmt.Errorf("fake store: duplicate key %q", in.Match.Key)
+					return nil, ErrConflict
 				}
 				item = it
 			}

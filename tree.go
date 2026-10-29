@@ -105,6 +105,22 @@ func (e *Engine) inTreeTransaction(ctx context.Context, fn func(ctx context.Cont
 	return internalErr(err, "tree transaction failed")
 }
 
+// write loads the matched item and applies write to it: directly for items outside the
+// tree (exactly as before trees existed), in a tree transaction for tree items.
+func (e *Engine) write(ctx context.Context, match ContentItemMatch, write func(ctx context.Context, item *ContentItem) error) (*ContentItem, error) {
+	item, err := e.loadByMatch(ctx, match)
+	if err != nil {
+		return nil, err
+	}
+	if e.onTree(item) {
+		return e.treeWrite(ctx, match, write)
+	}
+	if err := write(ctx, item); err != nil {
+		return nil, err
+	}
+	return item, nil
+}
+
 // treeWrite re-loads the matched item inside a tree transaction and applies write to it,
 // so the write is based on state no other tree write can change before it commits.
 func (e *Engine) treeWrite(ctx context.Context, match ContentItemMatch, write func(ctx context.Context, item *ContentItem) error) (*ContentItem, error) {

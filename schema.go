@@ -144,21 +144,6 @@ func (r *Registry) accepts(parent, child ContentType) bool {
 	return ok && slices.Contains(s.ChildTypes, child)
 }
 
-// containerTypes returns every registered tree container type, sorted.
-func (r *Registry) containerTypes() []ContentType {
-	var out []ContentType
-	if r == nil {
-		return out
-	}
-	for _, s := range r.schemas {
-		if len(s.ChildTypes) > 0 {
-			out = append(out, s.Type)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
 // all returns every registered schema, sorted by type for deterministic output.
 func (r *Registry) all() []ContentTypeSchema {
 	out := make([]ContentTypeSchema, 0, len(r.schemas))

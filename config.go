@@ -47,7 +47,9 @@ const (
 
 // ContentChange describes a successful content write so consuming applications
 // can invalidate the configured published or preview representation. ID and Key
-// identify the written item (both empty for OpContentReset).
+// identify the written item (both empty for OpContentReset). A change to a tree
+// container (publish, unpublish, archive, move) can change the visibility or path of
+// its whole subtree, which emits no events of its own.
 type ContentChange struct {
 	Type     ContentType
 	OwnerRef *OwnerRef

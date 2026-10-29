@@ -42,12 +42,9 @@ func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input List
 		return nil, internalErr(nil, "store does not support content trees")
 	}
 	if input.ParentID != "" {
-		parent, err := e.store.GetByID(ctx, input.ParentID)
-		if errors.Is(err, ErrNotFound) {
-			return nil, notFound(fmt.Sprintf("item %q not found", input.ParentID))
-		}
+		parent, err := e.loadByMatch(ctx, ContentItemMatch{ID: input.ParentID})
 		if err != nil {
-			return nil, internalErr(err, "load parent failed")
+			return nil, err
 		}
 		if _, err := e.visibleAncestors(ctx, view, parent); err != nil {
 			return nil, err
@@ -208,61 +205,68 @@ func childLifecycle(view SnapshotView) (ChildLifecycle, error) {
 }
 
 // withPublishedAncestors drops placed items with an ancestor that is not published or is
-// archived. It loads the published containers only when some item has a parent, so
-// snapshots without tree items are read exactly as before.
+// archived (items come from FindPublished, so they are visible themselves). Ancestors in
+// items are reused; others are loaded by ID, once per snapshot. Snapshots without placed
+// items are returned untouched without any further reads.
 func (e *Engine) withPublishedAncestors(ctx context.Context, items []*ContentItem) ([]*ContentItem, error) {
 	if !slices.ContainsFunc(items, func(item *ContentItem) bool { return item.ParentID != "" }) {
 		return items, nil
 	}
-	// Published, non-archived containers by ID, mapped to their parent ID. Without
-	// container types (an empty filter would select everything) no parent qualifies.
-	parents := map[string]string{}
-	if types := e.schemas.containerTypes(); len(types) > 0 {
-		containers, err := e.store.FindPublished(ctx, types, nil)
+	known := make(map[string]*ContentItem, len(items))
+	for _, item := range items {
+		known[item.ID] = item
+	}
+	visible := map[string]bool{} // ID -> it and all its ancestors are visible
+	out := make([]*ContentItem, 0, len(items))
+	for _, item := range items {
+		ok, err := e.publishedChain(ctx, item, known, visible)
 		if err != nil {
 			return nil, err
 		}
-		for _, container := range containers {
-			parents[container.ID] = container.ParentID
-		}
-	}
-	reachable := map[string]bool{}
-	out := make([]*ContentItem, 0, len(items))
-	for _, item := range items {
-		if item.ParentID == "" || reachesRoot(item.ParentID, parents, reachable) {
+		if ok {
 			out = append(out, item)
 		}
 	}
 	return out, nil
 }
 
-// reachesRoot reports whether the chain from id up to the root consists of entries of
-// parents only, memoizing the answer for every ID on the way. A cycle never reaches it.
-func reachesRoot(id string, parents map[string]string, memo map[string]bool) bool {
+// publishedChain reports whether item and all its ancestors are visible in the published
+// view, loading unknown ancestors into known and memoizing every answer in visible. A
+// missing ancestor or a cycle makes the chain invisible.
+func (e *Engine) publishedChain(ctx context.Context, item *ContentItem, known map[string]*ContentItem, visible map[string]bool) (bool, error) {
 	var chain []string
-	seen := map[string]bool{}
 	result := false
 	for {
-		if known, ok := memo[id]; ok {
-			result = known
+		if memo, ok := visible[item.ID]; ok {
+			result = memo
 			break
 		}
-		parent, ok := parents[id]
-		if !ok || seen[id] {
+		if !visibleIn(SnapshotViewPublished, item) || slices.Contains(chain, item.ID) {
 			break
 		}
-		seen[id] = true
-		chain = append(chain, id)
-		if parent == "" {
+		chain = append(chain, item.ID)
+		if item.ParentID == "" {
 			result = true
 			break
 		}
-		id = parent
+		parent, ok := known[item.ParentID]
+		if !ok {
+			loaded, err := e.store.GetByID(ctx, item.ParentID)
+			if errors.Is(err, ErrNotFound) {
+				break
+			}
+			if err != nil {
+				return false, err
+			}
+			known[loaded.ID] = loaded
+			parent = loaded
+		}
+		item = parent
 	}
-	for _, visited := range chain {
-		memo[visited] = result
+	for _, id := range chain {
+		visible[id] = result
 	}
-	return result
+	return result, nil
 }
 
 // projection validates requested field IDs and returns them in the form ChildQuery takes:

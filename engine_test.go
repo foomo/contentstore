@@ -778,3 +778,19 @@ func TestSaveDraftRejects(t *testing.T) {
 		wantKind(t, err, KindBadRequest)
 	}
 }
+
+// conflictingSetFieldStore reports a key held by another type, as the persistor does
+// when a concurrent create of the key with another type wins the race.
+type conflictingSetFieldStore struct{ *fakeStore }
+
+func (conflictingSetFieldStore) SetField(context.Context, FieldUpdate) (*ContentItem, error) {
+	return nil, ErrConflict
+}
+
+func TestSetFieldValueMapsKeyTypeConflict(t *testing.T) {
+	e := newTestEngine(conflictingSetFieldStore{newFakeStore()})
+	_, err := e.SetFieldValue(context.Background(), SetFieldValueInput{
+		Match: ContentItemMatch{Key: "k"}, Type: testType, FieldID: "metaTitle", Locale: "de", Value: "x",
+	})
+	wantKind(t, err, KindConflict)
+}

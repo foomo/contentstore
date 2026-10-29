@@ -286,3 +286,37 @@ func TestArchivedSnapshotKeepsPlacement(t *testing.T) {
 		t.Fatalf("archived item placement = %q/%q", got.ParentID, got.Name)
 	}
 }
+
+// TestGetSnapshotFollowsStoredParentsAfterSchemaDrift: after a schema release drops the
+// folder's ChildTypes, the published snapshot still decides visibility from the stored
+// parent chain, like ListChildren and GetTreeItem do.
+func TestGetSnapshotFollowsStoredParentsAfterSchemaDrift(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	items := buildReadTree(t, newTreeEngine(store))
+	reg := testRegistry()
+	reg.Register(NewSchema(folderType, "2", []FieldDefinition{{ID: "title", Type: FieldTypeSymbol}}))
+	reg.Register(NewSchema(documentType, "2", []FieldDefinition{{ID: "title", Type: FieldTypeSymbol}, {ID: "body", Type: FieldTypeText}}))
+	e := New(Deps{Store: store, Schemas: reg, Locales: testLocales, NewID: func() string { return "unused" }})
+
+	snapshot, err := e.GetSnapshot(ctx, SnapshotViewPublished, SnapshotInput{Types: []ContentType{documentType}})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	var got []string
+	for _, item := range snapshot.Items {
+		got = append(got, item.Name)
+	}
+	slices.Sort(got)
+	if want := []string{"a", "readme"}; !slices.Equal(got, want) {
+		t.Fatalf("published snapshot = %v, want %v", got, want)
+	}
+	page, err := e.ListChildren(ctx, SnapshotViewPublished, ListChildrenInput{ParentID: items["kb"].ID})
+	if err != nil || !slices.Equal(names(page.Items), []string{"a"}) {
+		t.Fatalf("published children = %+v, err = %v", page, err)
+	}
+	// A save that restates the current placement keeps working on the drifted type.
+	if _, err := e.SaveDraft(ctx, SaveDraftInput{Match: ContentItemMatch{ID: items["a"].ID}, Type: documentType, ParentID: items["kb"].ID, Name: "a", Fields: titleFields("v2")}); err != nil {
+		t.Fatalf("save on drifted type: %v", err)
+	}
+}
