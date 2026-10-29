@@ -77,6 +77,9 @@ func validateContentExport(export ContentExport) error {
 	if err := validateContentItems(export.Items); err != nil {
 		return err
 	}
+	if err := validateContentTree(export.Items); err != nil {
+		return err
+	}
 	checksum, err := contentItemsChecksum(export.Items)
 	if err != nil {
 		return fmt.Errorf("calculate content export checksum: %w", err)
@@ -111,6 +114,59 @@ func validateContentItems(items []*ContentItem) error {
 			return fmt.Errorf("content export contains duplicate key %q", item.Key)
 		}
 		keys[item.Key] = struct{}{}
+	}
+	return nil
+}
+
+// validateContentTree checks the tree invariants an import must satisfy: placed items have
+// a valid name unique within their parent, every parent is in the payload, there are no
+// cycles, and no live item sits under an archived parent. Without a schema registry it
+// cannot check ChildTypes. Exports deliberately skip it so a backup always succeeds.
+func validateContentTree(items []*ContentItem) error {
+	byID := make(map[string]*ContentItem, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	names := map[[2]string]string{}
+	for _, item := range items {
+		if item.Name == "" {
+			if item.ParentID != "" {
+				return fmt.Errorf("content export item %q has a parent but no name", item.ID)
+			}
+			continue
+		}
+		if err := validateName(item.Name); err != nil {
+			return fmt.Errorf("content export item %q: %w", item.ID, err)
+		}
+		placement := [2]string{item.ParentID, item.Name}
+		if other, exists := names[placement]; exists {
+			return fmt.Errorf("content export items %q and %q have the same name %q in one parent", other, item.ID, item.Name)
+		}
+		names[placement] = item.ID
+		if item.ParentID == "" {
+			continue
+		}
+		parent, exists := byID[item.ParentID]
+		if !exists {
+			return fmt.Errorf("content export item %q has a missing parent %q", item.ID, item.ParentID)
+		}
+		if item.ArchivedAt == nil && parent.ArchivedAt != nil {
+			return fmt.Errorf("content export item %q is not archived but its parent %q is", item.ID, parent.ID)
+		}
+	}
+	// Every parent exists now, so walking up from each item ends at the root or a cycle.
+	acyclic := map[string]bool{}
+	for _, item := range items {
+		seen := map[string]bool{}
+		for id := item.ID; id != "" && !acyclic[id]; id = byID[id].ParentID {
+			if seen[id] {
+				return fmt.Errorf("content export tree contains a cycle at %q", id)
+			}
+			seen[id] = true
+		}
+		for id := range seen {
+			acyclic[id] = true
+		}
 	}
 	return nil
 }

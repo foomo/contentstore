@@ -207,7 +207,7 @@ func TestTreeMove(t *testing.T) {
 		t.Fatalf("expected 3 move events (no-op emits nothing), got %+v", notifier.changes)
 	}
 	for _, c := range notifier.changes {
-		if c.Op != OpMove || c.Type != documentType {
+		if c.Op != OpMove || c.Type != documentType || c.ID != doc.ID {
 			t.Fatalf("unexpected change %+v", c)
 		}
 	}

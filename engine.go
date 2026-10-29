@@ -433,7 +433,7 @@ func (e *Engine) emit(item *ContentItem, op string) {
 	if s, ok := e.schemas.schemaFor(item.Type); ok && s.SuppressChangeEvents {
 		return
 	}
-	e.notify(ContentChange{Type: item.Type, OwnerRef: item.OwnerRef, Op: op})
+	e.notify(ContentChange{Type: item.Type, OwnerRef: item.OwnerRef, Op: op, ID: item.ID, Key: item.Key})
 }
 
 // GetItem returns a single item by match.

@@ -46,11 +46,14 @@ const (
 )
 
 // ContentChange describes a successful content write so consuming applications
-// can invalidate the configured published or preview representation.
+// can invalidate the configured published or preview representation. ID and Key
+// identify the written item (both empty for OpContentReset).
 type ContentChange struct {
 	Type     ContentType
 	OwnerRef *OwnerRef
 	Op       string
+	ID       string `json:",omitempty"`
+	Key      string `json:",omitempty"`
 }
 
 // Notifier is a best-effort hook invoked on content changes. It must not

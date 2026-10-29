@@ -104,6 +104,68 @@ func TestReplaceContentRejectsInvalidExportBeforeWrite(t *testing.T) {
 	}
 }
 
+// placedTransferItem is transferTestItem placed in a content tree.
+func placedTransferItem(id, parentID, name string, archived bool) *ContentItem {
+	item := transferTestItem(id, "", time.Now().UTC())
+	item.Type = documentType
+	item.ParentID, item.Name = parentID, name
+	if archived {
+		item.ArchivedAt = &item.UpdatedAt
+	}
+	return item
+}
+
+func TestReplaceContentValidatesTree(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		items   []*ContentItem
+		wantErr bool
+	}{
+		{"valid tree", []*ContentItem{
+			placedTransferItem("root", "", "kb", false),
+			placedTransferItem("child", "root", "doc", false),
+			placedTransferItem("archived", "root", "old", true),
+			placedTransferItem("archived-child", "archived", "doc", true),
+		}, false},
+		{"parent without name", []*ContentItem{placedTransferItem("root", "", "kb", false), placedTransferItem("child", "root", "", false)}, true},
+		{"invalid name", []*ContentItem{placedTransferItem("root", "", "a/b", false)}, true},
+		{"duplicate name in a parent", []*ContentItem{
+			placedTransferItem("root", "", "kb", false),
+			placedTransferItem("a", "root", "doc", false),
+			placedTransferItem("b", "root", "doc", true),
+		}, true},
+		{"duplicate name at root", []*ContentItem{placedTransferItem("a", "", "kb", false), placedTransferItem("b", "", "kb", false)}, true},
+		{"missing parent", []*ContentItem{placedTransferItem("child", "nope", "doc", false)}, true},
+		{"live item under an archived parent", []*ContentItem{
+			placedTransferItem("root", "", "kb", true),
+			placedTransferItem("child", "root", "doc", false),
+		}, true},
+		{"cycle", []*ContentItem{placedTransferItem("a", "b", "a", false), placedTransferItem("b", "a", "b", false)}, true},
+		{"self parent", []*ContentItem{placedTransferItem("a", "a", "a", false)}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			export, err := newContentExport(tt.items)
+			if err != nil {
+				t.Fatalf("export must not validate the tree: %v", err)
+			}
+			store := newFakeStore()
+			engine := New(Deps{Store: store, Role: DeploymentRoleSandbox})
+			_, err = engine.ReplaceContent(context.Background(), *export)
+			if tt.wantErr {
+				wantKind(t, err, KindBadRequest)
+				if len(store.items) != 0 {
+					t.Fatalf("data changed after rejected replacement: %#v", store.items)
+				}
+			} else if err != nil {
+				t.Fatalf("ReplaceContent: %v", err)
+			}
+		})
+	}
+}
+
 func TestReplaceContentInstallsSnapshotAndEmitsReset(t *testing.T) {
 	t.Parallel()
 	store := newFakeStore()
