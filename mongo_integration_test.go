@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -211,4 +212,117 @@ func mongoURLForTest(t *testing.T) string {
 		}
 	})
 	return localMongoEndpoint + name
+}
+
+// TestLegacyDocumentsSurviveInMongo seeds documents exactly as the pre-tree code persisted
+// them, then opens the store on the populated collection (which (re)creates indexes) and
+// runs every lifecycle operation. The documents must keep working and must never gain
+// fields that only tree/size-limit features write.
+func TestLegacyDocumentsSurviveInMongo(t *testing.T) {
+	ctx := context.Background()
+	url := mongoURLForTest(t)
+	client, db, err := connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
+
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	snapshot := func(revision int64) bson.D {
+		return bson.D{
+			{Key: "revision", Value: revision},
+			{Key: "schemaVersion", Value: "1"},
+			{Key: "schemaHash", Value: "legacy-hash"},
+			{Key: "fields", Value: bson.D{
+				{Key: "metaTitle", Value: bson.D{{Key: "de", Value: "Titel"}, {Key: "fr", Value: "Titre"}}},
+				{Key: "filterSelection", Value: bson.D{{Key: "de", Value: bson.D{{Key: "brand", Value: "nike"}}}}},
+			}},
+			{Key: "createdAt", Value: now},
+			{Key: "updatedAt", Value: now},
+		}
+	}
+	legacy := []any{
+		bson.D{
+			{Key: "_id", Value: "legacy-published"},
+			{Key: "key", Value: "legacy:published"},
+			{Key: "type", Value: testType},
+			{Key: "ownerRef", Value: bson.D{{Key: "source", Value: "contentful"}, {Key: "type", Value: "shopCategory"}, {Key: "id", Value: "cat-1"}}},
+			{Key: "draft", Value: snapshot(2)},
+			{Key: "published", Value: snapshot(2)},
+			{Key: "createdAt", Value: now},
+			{Key: "updatedAt", Value: now},
+		},
+		bson.D{
+			{Key: "_id", Value: "legacy-draft"},
+			{Key: "type", Value: testType},
+			{Key: "draft", Value: snapshot(1)},
+			{Key: "createdAt", Value: now},
+			{Key: "updatedAt", Value: now},
+		},
+	}
+	raw := client.Database(db).Collection(collectionContentItems)
+	if _, err := raw.InsertMany(ctx, legacy); err != nil {
+		t.Fatalf("seed legacy documents: %v", err)
+	}
+
+	store, err := NewMongoStore(ctx, url)
+	if err != nil {
+		t.Fatalf("NewMongoStore on populated collection: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	engine := newTestEngine(store)
+
+	published, err := engine.GetSnapshot(ctx, SnapshotViewPublished, SnapshotInput{Types: []ContentType{testType}})
+	if err != nil {
+		t.Fatalf("published snapshot: %v", err)
+	}
+	if len(published.Items) != 1 || published.Items[0].ID != "legacy-published" || published.Items[0].Fields["metaTitle"]["fr"] != "Titre" {
+		t.Fatalf("published snapshot = %+v", published.Items)
+	}
+	preview, err := engine.GetSnapshot(ctx, SnapshotViewPreview, SnapshotInput{})
+	if err != nil || len(preview.Items) != 2 {
+		t.Fatalf("preview snapshot: items=%v err=%v", preview, err)
+	}
+
+	steps := []func() error{
+		func() error {
+			_, err := engine.SetFieldValue(ctx, SetFieldValueInput{Match: ContentItemMatch{Key: "legacy:published"}, FieldID: "metaTitle", Locale: "de", Value: "Neu"})
+			return err
+		},
+		func() error {
+			_, err := engine.SaveDraft(ctx, SaveDraftInput{Match: ContentItemMatch{ID: "legacy-draft"}, Fields: validFields()})
+			return err
+		},
+		func() error { _, err := engine.Publish(ctx, ContentItemMatch{Key: "legacy:published"}); return err },
+		func() error { _, err := engine.Publish(ctx, ContentItemMatch{ID: "legacy-draft"}); return err },
+		func() error { _, err := engine.Unpublish(ctx, ContentItemMatch{ID: "legacy-draft"}); return err },
+		func() error { _, err := engine.Archive(ctx, ContentItemMatch{Key: "legacy:published"}); return err },
+		func() error { _, err := engine.Unarchive(ctx, ContentItemMatch{Key: "legacy:published"}); return err },
+	}
+	for i, step := range steps {
+		if err := step(); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+
+	legacyKeys := map[string]bool{"_id": true, "key": true, "type": true, "ownerRef": true, "draft": true, "published": true, "archivedAt": true, "createdAt": true, "updatedAt": true}
+	cur, err := raw.Find(ctx, bson.D{})
+	if err != nil {
+		t.Fatalf("find raw: %v", err)
+	}
+	var docs []bson.D
+	if err := cur.All(ctx, &docs); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	for _, doc := range docs {
+		for _, e := range doc {
+			if !legacyKeys[e.Key] {
+				t.Fatalf("legacy document gained field %q: %v", e.Key, doc)
+			}
+		}
+	}
+
+	if deleted, err := engine.Delete(ctx, ContentItemMatch{ID: "legacy-draft"}); err != nil || !deleted {
+		t.Fatalf("delete legacy item: deleted=%v err=%v", deleted, err)
+	}
 }
