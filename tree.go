@@ -16,6 +16,8 @@ import (
 // ContentStore so existing implementations of that interface keep compiling.
 type ContentTree interface {
 	Move(ctx context.Context, input MoveInput) (*ContentItem, error)
+	ListChildren(ctx context.Context, view SnapshotView, input ListChildrenInput) (*ChildrenPage, error)
+	GetTreeItem(ctx context.Context, view SnapshotView, input TreeItemInput) (*TreeItem, error)
 }
 
 var _ ContentTree = (*Engine)(nil)

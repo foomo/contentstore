@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -206,5 +207,60 @@ func TestTreePublishRacesMoveInMongo(t *testing.T) {
 		if got := getItem(t, e, doc.ID); got.ParentID != to.ID || got.Published == nil {
 			t.Fatalf("round %d: publish and move must both survive: parent=%q published=%v", round, got.ParentID, got.Published != nil)
 		}
+	}
+}
+
+// TestTreeReadsInMongo runs the tree reads against the persistor's filters, projections
+// and indexes (see buildReadTree for the tree).
+func TestTreeReadsInMongo(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newMongoTreeEngine(t)
+	items := buildReadTree(t, e)
+	kb := items["kb"].ID
+
+	var got []string
+	input := ListChildrenInput{ParentID: kb, Limit: 1, Fields: []FieldID{"title"}}
+	for {
+		page, err := e.ListChildren(ctx, SnapshotViewPreview, input)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, item := range page.Items {
+			if _, ok := item.Fields["body"]; ok || item.Fields["title"]["de"] != item.Name {
+				t.Fatalf("projected fields of %s = %v", item.Name, item.Fields)
+			}
+		}
+		got = append(got, names(page.Items)...)
+		if page.NextCursor == "" {
+			break
+		}
+		input.Cursor = page.NextCursor
+	}
+	if want := []string{"a", "b", "drafts"}; !slices.Equal(got, want) {
+		t.Fatalf("paged preview children = %v, want %v", got, want)
+	}
+	page, err := e.ListChildren(ctx, SnapshotViewPublished, ListChildrenInput{ParentID: kb})
+	if err != nil || !slices.Equal(names(page.Items), []string{"a"}) || page.Items[0].Fields["body"]["de"] != "# A" {
+		t.Fatalf("published children = %+v, err = %v", page, err)
+	}
+
+	item, err := e.GetTreeItem(ctx, SnapshotViewPreview, TreeItemInput{Path: "/kb/drafts/d"})
+	if err != nil || item.Item.ID != items["d"].ID || item.Path != "/kb/drafts/d" || len(item.Ancestors) != 2 {
+		t.Fatalf("path lookup = %+v, err = %v", item, err)
+	}
+	_, err = e.GetTreeItem(ctx, SnapshotViewPublished, TreeItemInput{Path: "/kb/drafts/d"})
+	wantKind(t, err, KindNotFound)
+
+	snapshot, err := e.GetSnapshot(ctx, SnapshotViewPublished, SnapshotInput{Types: []ContentType{documentType}})
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	var published []string
+	for _, item := range snapshot.Items {
+		published = append(published, item.Name)
+	}
+	slices.Sort(published)
+	if want := []string{"a", "readme"}; !slices.Equal(published, want) {
+		t.Fatalf("published snapshot = %v, want %v", published, want)
 	}
 }

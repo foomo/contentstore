@@ -461,44 +461,58 @@ func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input Snaps
 		return nil, internalErr(err, "snapshot read failed")
 	}
 
+	if view == SnapshotViewPublished {
+		// Placed items are visible only while every ancestor is published too.
+		if items, err = e.withPublishedAncestors(ctx, items); err != nil {
+			return nil, internalErr(err, "snapshot read failed")
+		}
+	}
+
 	snapshot := &Snapshot{CreatedAt: time.Now().UTC(), Items: make([]SnapshotItem, 0, len(items))}
 	for _, item := range items {
-		var (
-			fields    ContentFields
-			state     string
-			updatedAt time.Time
-		)
-		switch view {
-		case SnapshotViewPublished:
-			if item.Published == nil { // defensive; FindPublished already filters these out
-				continue
-			}
-			fields = item.Published.Fields
-			state = StatePublished
-			updatedAt = item.Published.UpdatedAt
-		case SnapshotViewPreview:
-			if item.Draft == nil { // defensive; a non-archived item always has a draft
-				continue
-			}
-			fields = item.Draft.Fields
-			state = item.State()
-			updatedAt = item.UpdatedAt
+		// Defensive skip: FindPublished only returns published items and a non-archived
+		// item always has a draft.
+		snapshotItem, ok := toSnapshotItem(view, item)
+		if !ok {
+			continue
 		}
-
-		snapshot.Items = append(snapshot.Items, SnapshotItem{
-			ID:        item.ID,
-			Key:       item.Key,
-			Type:      item.Type,
-			OwnerRef:  item.OwnerRef,
-			State:     state,
-			Fields:    fields,
-			UpdatedAt: updatedAt,
-		})
-		if revision := updatedAt.UnixNano(); revision > snapshot.Revision {
+		snapshot.Items = append(snapshot.Items, snapshotItem)
+		if revision := snapshotItem.UpdatedAt.UnixNano(); revision > snapshot.Revision {
 			snapshot.Revision = revision
 		}
 	}
 	return snapshot, nil
+}
+
+// toSnapshotItem returns item's representation in view, or false when it has none.
+func toSnapshotItem(view SnapshotView, item *ContentItem) (SnapshotItem, bool) {
+	out := SnapshotItem{
+		ID:       item.ID,
+		Key:      item.Key,
+		Type:     item.Type,
+		OwnerRef: item.OwnerRef,
+		ParentID: item.ParentID,
+		Name:     item.Name,
+	}
+	switch view {
+	case SnapshotViewPublished:
+		if item.Published == nil {
+			return SnapshotItem{}, false
+		}
+		out.Fields = item.Published.Fields
+		out.State = StatePublished
+		out.UpdatedAt = item.Published.UpdatedAt
+	case SnapshotViewPreview:
+		if item.Draft == nil {
+			return SnapshotItem{}, false
+		}
+		out.Fields = item.Draft.Fields
+		out.State = item.State()
+		out.UpdatedAt = item.UpdatedAt
+	default:
+		return SnapshotItem{}, false
+	}
+	return out, true
 }
 
 // GetArchivedSnapshot returns all archived content, optionally narrowed by type — the
@@ -520,6 +534,8 @@ func (e *Engine) GetArchivedSnapshot(ctx context.Context, input ArchivedSnapshot
 			Key:        item.Key,
 			Type:       item.Type,
 			OwnerRef:   item.OwnerRef,
+			ParentID:   item.ParentID,
+			Name:       item.Name,
 			Fields:     item.Draft.Fields,
 			ArchivedAt: *item.ArchivedAt,
 			UpdatedAt:  item.UpdatedAt,

@@ -184,6 +184,8 @@ type SnapshotItem struct {
 	Key       string        `json:"key,omitempty"`
 	Type      ContentType   `json:"type"`
 	OwnerRef  *OwnerRef     `json:"ownerRef,omitempty"`
+	ParentID  string        `json:"parentId,omitempty"`
+	Name      string        `json:"name,omitempty"`
 	State     string        `json:"state"`
 	Fields    ContentFields `json:"fields"`
 	UpdatedAt time.Time     `json:"updatedAt"`
@@ -212,9 +214,53 @@ type ArchivedContentItem struct {
 	Key        string        `json:"key,omitempty"`
 	Type       ContentType   `json:"type"`
 	OwnerRef   *OwnerRef     `json:"ownerRef,omitempty"`
+	ParentID   string        `json:"parentId,omitempty"`
+	Name       string        `json:"name,omitempty"`
 	Fields     ContentFields `json:"fields"`
 	ArchivedAt time.Time     `json:"archivedAt"`
 	UpdatedAt  time.Time     `json:"updatedAt"`
+}
+
+// ListChildrenInput lists the children of ParentID (named root-level items when empty),
+// ordered by name. Types narrows them by content type and Fields projects their field
+// sets (all fields when empty). Limit defaults to 100 and may be at most 1000; Cursor
+// continues from a previous page's NextCursor.
+type ListChildrenInput struct {
+	ParentID string        `json:"parentId,omitempty"`
+	Types    []ContentType `json:"types,omitempty"`
+	Fields   []FieldID     `json:"fields,omitempty"`
+	Limit    int           `json:"limit,omitempty"`
+	Cursor   string        `json:"cursor,omitempty"`
+}
+
+// ChildrenPage is one page of ListChildren. NextCursor is empty on the last page.
+type ChildrenPage struct {
+	Items      []SnapshotItem `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
+}
+
+// TreeItemInput addresses one item either by Match or by Path ("/kb/tables/users", the
+// names from the root level down; the leading slash is optional). Fields projects its
+// field set (all fields when empty).
+type TreeItemInput struct {
+	Match  ContentItemMatch `json:"match"`
+	Path   string           `json:"path,omitempty"`
+	Fields []FieldID        `json:"fields,omitempty"`
+}
+
+// TreeItem is one item in a snapshot view with its ancestors (root first) and its path.
+// Items outside the tree have no ancestors and an empty path.
+type TreeItem struct {
+	Item      SnapshotItem `json:"item"`
+	Ancestors []TreeRef    `json:"ancestors"`
+	Path      string       `json:"path,omitempty"`
+}
+
+// TreeRef identifies an ancestor in a TreeItem.
+type TreeRef struct {
+	ID   string      `json:"id"`
+	Type ContentType `json:"type"`
+	Name string      `json:"name"`
 }
 
 // SchemasResult exposes the registered content schemas.
