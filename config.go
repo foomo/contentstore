@@ -42,6 +42,7 @@ const (
 	OpUnarchive    = "unarchive"
 	OpDelete       = "delete"
 	OpContentReset = "contentReset"
+	OpMove         = "move"
 )
 
 // ContentChange describes a successful content write so consuming applications

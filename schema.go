@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -58,6 +59,12 @@ type ContentTypeSchema struct {
 	// hashes. Use it for types with no downstream published-change consumer (e.g. an
 	// internal, never-published draft type) so their deletes stay quiet.
 	SuppressChangeEvents bool `json:"suppressChangeEvents,omitempty"`
+
+	// ChildTypes makes this type a tree container: items of the listed types (which may
+	// include this type itself) can be placed under items of this type. A type that is
+	// a container or listed by one is a tree type; its items carry a Name unique within
+	// their parent. Like SuppressChangeEvents it is a policy and not part of the hash.
+	ChildTypes []ContentType `json:"childTypes,omitempty"`
 }
 
 // FieldDefinition describes one field. ReadOnly marks system-generated fields editors
@@ -111,8 +118,45 @@ func (r *Registry) Register(s ContentTypeSchema) {
 }
 
 func (r *Registry) schemaFor(t ContentType) (ContentTypeSchema, bool) {
+	if r == nil {
+		return ContentTypeSchema{}, false
+	}
 	s, ok := r.schemas[t]
 	return s, ok
+}
+
+// isTreeType reports whether t is a tree container or a child type of one.
+func (r *Registry) isTreeType(t ContentType) bool {
+	if r == nil || t == "" {
+		return false
+	}
+	for _, s := range r.schemas {
+		if (s.Type == t && len(s.ChildTypes) > 0) || slices.Contains(s.ChildTypes, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// accepts reports whether items of type child may be placed under items of type parent.
+func (r *Registry) accepts(parent, child ContentType) bool {
+	s, ok := r.schemaFor(parent)
+	return ok && slices.Contains(s.ChildTypes, child)
+}
+
+// containerTypes returns every registered tree container type, sorted.
+func (r *Registry) containerTypes() []ContentType {
+	var out []ContentType
+	if r == nil {
+		return out
+	}
+	for _, s := range r.schemas {
+		if len(s.ChildTypes) > 0 {
+			out = append(out, s.Type)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // all returns every registered schema, sorted by type for deterministic output.

@@ -44,3 +44,47 @@ type FieldUpdate struct {
 	Now           time.Time
 	NewID         string
 }
+
+// TreeStore is the optional persistence contract for content trees. *Persistor
+// implements it; an Engine over a Store without it rejects tree operations, so existing
+// Store implementations keep working unchanged.
+type TreeStore interface {
+	Store
+	// RunTreeTransaction runs fn in a transaction serialized with every other tree
+	// transaction. fn receives the transactional context, must route all its reads and
+	// writes through it, and may run more than once.
+	RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error
+	// FindChildren returns the items placed under a parent, ordered by name. Results can
+	// be projected (see ChildQuery.Fields) and must then never be written back.
+	FindChildren(ctx context.Context, q ChildQuery) ([]*ContentItem, error)
+}
+
+// ChildLifecycle selects the lifecycle states FindChildren returns.
+type ChildLifecycle int
+
+const (
+	// ChildrenAny returns children in every state, archived included.
+	ChildrenAny ChildLifecycle = iota
+	// ChildrenLive returns non-archived children.
+	ChildrenLive
+	// ChildrenPublished returns published, non-archived children.
+	ChildrenPublished
+)
+
+// ChildQuery selects the children of one parent.
+type ChildQuery struct {
+	// ParentID is the parent's ID; empty selects named root-level items.
+	ParentID string
+	// Name selects the child with exactly this name when set.
+	Name string
+	// AfterName selects children whose name sorts after it (keyset pagination).
+	AfterName string
+	Lifecycle ChildLifecycle
+	// Types narrows the children by content type (all when empty).
+	Types []ContentType
+	// Fields projects the draft and published field sets: nil keeps every field, an empty
+	// slice keeps none (structure, placement, lifecycle and revisions only).
+	Fields []FieldID
+	// Limit caps the number of children (unlimited when zero).
+	Limit int
+}

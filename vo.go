@@ -65,11 +65,18 @@ type ContentSnapshot struct {
 
 // ContentItem is one stored content piece, persisted as a single MongoDB document
 // (ID is the Mongo _id). Draft and Published snapshots live in the same document.
+//
+// ParentID and Name place an item of a tree type in its content tree (see
+// ContentTypeSchema.ChildTypes). Like Key and OwnerRef they are structural and not
+// versioned: a move or rename applies to the draft and published views at once. An empty
+// ParentID with a Name means root level; items of other types carry neither.
 type ContentItem struct {
 	ID         string           `json:"id" bson:"_id"`
 	Key        string           `json:"key,omitempty" bson:"key,omitempty"`
 	Type       ContentType      `json:"type" bson:"type"`
 	OwnerRef   *OwnerRef        `json:"ownerRef,omitempty" bson:"ownerRef,omitempty"`
+	ParentID   string           `json:"parentId,omitempty" bson:"parentId,omitempty"`
+	Name       string           `json:"name,omitempty" bson:"name,omitempty"`
 	Draft      *ContentSnapshot `json:"draft,omitempty" bson:"draft,omitempty"`
 	Published  *ContentSnapshot `json:"published,omitempty" bson:"published,omitempty"`
 	ArchivedAt *time.Time       `json:"archivedAt,omitempty" bson:"archivedAt,omitempty"`
@@ -117,12 +124,26 @@ type ContentItemMatch struct {
 // SaveDraftInput is the request for SaveDraft. Type is required only when creating.
 // ExpectedRevision is optional: nil preserves unconditional save behavior, zero creates
 // only when no item exists, and a positive value updates only that draft revision.
+//
+// ParentID and Name place a new item of a tree type (Name is required for those; an empty
+// ParentID means root level). On update they may be omitted or must match the current
+// placement: use Move to change it.
 type SaveDraftInput struct {
 	Match            ContentItemMatch `json:"match"`
 	Type             ContentType      `json:"type,omitempty"`
 	OwnerRef         *OwnerRef        `json:"ownerRef,omitempty"`
+	ParentID         string           `json:"parentId,omitempty"`
+	Name             string           `json:"name,omitempty"`
 	Fields           ContentFields    `json:"fields"`
 	ExpectedRevision *int64           `json:"expectedRevision,omitempty"`
+}
+
+// MoveInput moves and/or renames a tree item. A nil ParentID keeps the current parent and
+// a pointer to "" moves the item to root level; an empty Name keeps the current name.
+type MoveInput struct {
+	Match    ContentItemMatch `json:"match"`
+	ParentID *string          `json:"parentId,omitempty"`
+	Name     string           `json:"name,omitempty"`
 }
 
 // SetFieldValueInput sets a single field's value for one locale, merging into the item's

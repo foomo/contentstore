@@ -122,8 +122,10 @@ func mustJSON(t *testing.T, v any) string {
 	return string(b)
 }
 
-// recordingStore wraps the in-memory fake store and logs every Store call with the
-// arguments that determine what the call reads or writes.
+// recordingStore wraps the in-memory fake store and logs every Store and TreeStore call
+// with the arguments that determine what the call reads or writes. It implements
+// TreeStore so the engine could use tree operations: the golden sequence proves it does
+// not for existing content types.
 type recordingStore struct {
 	inner *fakeStore
 	calls []string
@@ -185,6 +187,16 @@ func (r *recordingStore) ExportAll(ctx context.Context) ([]*ContentItem, error) 
 func (r *recordingStore) ReplaceAll(ctx context.Context, items []*ContentItem) error {
 	r.record("ReplaceAll(%d)", len(items))
 	return r.inner.ReplaceAll(ctx, items)
+}
+
+func (r *recordingStore) RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	r.record("RunTreeTransaction()")
+	return r.inner.RunTreeTransaction(ctx, fn)
+}
+
+func (r *recordingStore) FindChildren(ctx context.Context, q ChildQuery) ([]*ContentItem, error) {
+	r.record("FindChildren(%+v)", q)
+	return r.inner.FindChildren(ctx, q)
 }
 
 // compatStep is one ContentStore operation of the legacy-type scenario.
@@ -445,7 +457,9 @@ func TestCompatWireShapes(t *testing.T) {
 func TestCompatStoreCallSequence(t *testing.T) {
 	ctx := context.Background()
 	rec := &recordingStore{inner: newFakeStore()}
-	e := newTestEngine(rec)
+	var _ TreeStore = rec
+	// Tree types are registered next to the legacy type, as a knowledge base would.
+	e := New(Deps{Store: rec, Schemas: treeRegistry(), Locales: testLocales, NewID: testNewID()})
 	var got []string
 	for _, step := range compatScenario() {
 		rec.calls = nil
