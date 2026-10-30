@@ -192,8 +192,10 @@ func mongoURLForTest(t *testing.T) string {
 	}
 
 	name := regexp.MustCompile(`[^a-zA-Z0-9_]`).ReplaceAllString(t.Name(), "_")
-	if len(name) > 40 {
-		name = name[:40]
+	// MongoDB database names are at most 63 characters: "contentstore_" + name + "_" +
+	// a 19-digit timestamp leaves 30 for the test name.
+	if len(name) > 30 {
+		name = name[:30]
 	}
 	name = fmt.Sprintf("contentstore_%s_%d", name, time.Now().UnixNano())
 	t.Cleanup(func() {
