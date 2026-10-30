@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -35,6 +36,15 @@ const (
 	limitJSON     = 200_000
 )
 
+// MaxFieldLength is the largest value FieldDefinition.MaxLength accepts. A draft and its
+// published copy share one MongoDB document (16 MB), so a single value must stay well
+// below half of that.
+const MaxFieldLength = 2_000_000
+
+// maxDraftFieldsBytes bounds the encoded size of a draft's fields for types that raise
+// a field's MaxLength, so the draft and its published copy always fit one document.
+const maxDraftFieldsBytes = 7 << 20
+
 // ContentTypeSchema is the authoritative (Go-defined) schema for a content type.
 type ContentTypeSchema struct {
 	Type    ContentType       `json:"type"`
@@ -49,6 +59,12 @@ type ContentTypeSchema struct {
 	// hashes. Use it for types with no downstream published-change consumer (e.g. an
 	// internal, never-published draft type) so their deletes stay quiet.
 	SuppressChangeEvents bool `json:"suppressChangeEvents,omitempty"`
+
+	// ChildTypes makes this type a tree container: items of the listed types (which may
+	// include this type itself) can be placed under items of this type. A type that is
+	// a container or listed by one is a tree type; its items carry a Name unique within
+	// their parent. Like SuppressChangeEvents it is a policy and not part of the hash.
+	ChildTypes []ContentType `json:"childTypes,omitempty"`
 }
 
 // FieldDefinition describes one field. ReadOnly marks system-generated fields editors
@@ -67,6 +83,11 @@ type FieldDefinition struct {
 	FormatHint         string `json:"formatHint,omitempty"`
 	SuggestedMinLength *int   `json:"suggestedMinLength,omitempty"`
 	SuggestedMaxLength *int   `json:"suggestedMaxLength,omitempty"`
+
+	// MaxLength overrides the field type's default size limit (bytes for symbol/text,
+	// serialized bytes for richtext/json), up to MaxFieldLength. Unlike the Suggested*
+	// hints it is enforced. Nil keeps the default.
+	MaxLength *int `json:"maxLength,omitempty"`
 }
 
 // Registry holds the authoritative Go-defined content schemas. It is populated by
@@ -82,8 +103,14 @@ func NewRegistry() *Registry {
 }
 
 // Register adds (or replaces) a schema. It computes the structural Hash when the
-// schema does not already carry one.
+// schema does not already carry one. It panics on an invalid MaxLength, since schemas
+// are Go-defined startup configuration.
 func (r *Registry) Register(s ContentTypeSchema) {
+	for _, f := range s.Fields {
+		if err := f.validateMaxLength(); err != nil {
+			panic(fmt.Sprintf("contentstore: schema %q field %q: %v", s.Type, f.ID, err))
+		}
+	}
 	if s.Hash == "" {
 		s.Hash = schemaHash(s)
 	}
@@ -91,8 +118,30 @@ func (r *Registry) Register(s ContentTypeSchema) {
 }
 
 func (r *Registry) schemaFor(t ContentType) (ContentTypeSchema, bool) {
+	if r == nil {
+		return ContentTypeSchema{}, false
+	}
 	s, ok := r.schemas[t]
 	return s, ok
+}
+
+// isTreeType reports whether t is a tree container or a child type of one.
+func (r *Registry) isTreeType(t ContentType) bool {
+	if r == nil || t == "" {
+		return false
+	}
+	for _, s := range r.schemas {
+		if (s.Type == t && len(s.ChildTypes) > 0) || slices.Contains(s.ChildTypes, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// accepts reports whether items of type child may be placed under items of type parent.
+func (r *Registry) accepts(parent, child ContentType) bool {
+	s, ok := r.schemaFor(parent)
+	return ok && slices.Contains(s.ChildTypes, child)
 }
 
 // all returns every registered schema, sorted by type for deterministic output.
@@ -120,6 +169,10 @@ func schemaHash(s ContentTypeSchema) string {
 	fmt.Fprintf(h, "%s|%s", s.Type, s.Version)
 	for _, f := range s.Fields {
 		fmt.Fprintf(h, "|%s:%s:%t:%t:%t", f.ID, f.Type, f.Localized, f.Required, f.ReadOnly)
+		// Appended only when set so schemas without MaxLength keep their existing hash.
+		if f.MaxLength != nil {
+			fmt.Fprintf(h, ":max=%d", *f.MaxLength)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -131,6 +184,38 @@ func (s ContentTypeSchema) field(id FieldID) (FieldDefinition, bool) {
 		}
 	}
 	return FieldDefinition{}, false
+}
+
+// hasMaxLength reports whether any field overrides its size limit; only such types are
+// subject to the draft size guard.
+func (s ContentTypeSchema) hasMaxLength() bool {
+	for _, f := range s.Fields {
+		if f.MaxLength != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (f FieldDefinition) validateMaxLength() error {
+	if f.MaxLength == nil {
+		return nil
+	}
+	if fieldLimit(f.Type) == 0 {
+		return fmt.Errorf("maxLength is not supported for %s fields", f.Type)
+	}
+	if *f.MaxLength <= 0 || *f.MaxLength > MaxFieldLength {
+		return fmt.Errorf("maxLength must be between 1 and %d", MaxFieldLength)
+	}
+	return nil
+}
+
+// limit returns the field's enforced value-size limit.
+func (f FieldDefinition) limit() int {
+	if f.MaxLength != nil {
+		return *f.MaxLength
+	}
+	return fieldLimit(f.Type)
 }
 
 // fieldLimit returns the value-size limit for a field type.

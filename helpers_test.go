@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -74,10 +75,14 @@ func validFields() ContentFields {
 	})
 }
 
-// fakeStore is an in-memory Store for engine unit tests.
+// fakeStore is an in-memory TreeStore for engine unit tests. It mirrors the unique key
+// and (parentId, name) indexes of the MongoDB persistor.
 type fakeStore struct {
 	mu    sync.Mutex
 	items map[string]*ContentItem
+
+	treeMu           sync.Mutex
+	treeTransactions int
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{items: map[string]*ContentItem{}} }
@@ -105,6 +110,9 @@ func (f *fakeStore) GetByKey(_ context.Context, key string) (*ContentItem, error
 func (f *fakeStore) Upsert(_ context.Context, item *ContentItem, expectedDraftRevision *int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.nameTaken(item) {
+		return errDuplicateName
+	}
 	existing := f.items[item.ID]
 	if expectedDraftRevision != nil {
 		switch {
@@ -118,6 +126,21 @@ func (f *fakeStore) Upsert(_ context.Context, item *ContentItem, expectedDraftRe
 	}
 	f.items[item.ID] = cloneContentItem(item)
 	return nil
+}
+
+var errDuplicateName = errors.New("fake store: duplicate (parentId, name)")
+
+// nameTaken mirrors the persistor's partial unique (parentId, name) index.
+func (f *fakeStore) nameTaken(item *ContentItem) bool {
+	if item.Name == "" {
+		return false
+	}
+	for _, other := range f.items {
+		if other.ID != item.ID && other.ParentID == item.ParentID && other.Name == item.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeStore) hasKey(key string) bool {
@@ -144,6 +167,11 @@ func (f *fakeStore) SetField(_ context.Context, in FieldUpdate) (*ContentItem, e
 	case in.Match.Key != "":
 		for _, it := range f.items {
 			if it.Key == in.Match.Key {
+				// The persistor's key upsert also matches the type; a key held by another
+				// type makes its insert fail on the unique key index.
+				if it.Type != in.Type {
+					return nil, ErrConflict
+				}
 				item = it
 			}
 		}
@@ -283,6 +311,64 @@ func (f *fakeStore) ReplaceAll(_ context.Context, items []*ContentItem) error {
 	}
 	f.items = replacement
 	return nil
+}
+
+// RunTreeTransaction serializes tree transactions like the persistor's lock document. It
+// has no rollback: engine transactions validate first and write last.
+func (f *fakeStore) RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	f.treeMu.Lock()
+	defer f.treeMu.Unlock()
+	f.treeTransactions++
+	return fn(ctx)
+}
+
+func (f *fakeStore) FindChildren(_ context.Context, q ChildQuery) ([]*ContentItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*ContentItem
+	for _, it := range f.items {
+		switch {
+		case it.Name == "" || it.ParentID != q.ParentID || it.Name <= q.AfterName:
+			continue
+		case q.Name != "" && it.Name != q.Name:
+			continue
+		case q.Lifecycle == ChildrenLive && it.ArchivedAt != nil:
+			continue
+		case q.Lifecycle == ChildrenPublished && (it.Published == nil || it.ArchivedAt != nil):
+			continue
+		case len(q.Types) > 0 && !containsType(q.Types, it.Type):
+			continue
+		}
+		out = append(out, projectItem(cloneContentItem(it), q.Fields))
+	}
+	slices.SortFunc(out, func(a, b *ContentItem) int { return strings.Compare(a.Name, b.Name) })
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+// projectItem mirrors the persistor's FindChildren projection.
+func projectItem(item *ContentItem, fields []FieldID) *ContentItem {
+	if fields == nil {
+		return item
+	}
+	for _, snapshot := range []*ContentSnapshot{item.Draft, item.Published} {
+		if snapshot == nil {
+			continue
+		}
+		var projected ContentFields
+		for _, f := range fields {
+			if v, ok := snapshot.Fields[string(f)]; ok {
+				if projected == nil {
+					projected = ContentFields{}
+				}
+				projected[string(f)] = v
+			}
+		}
+		snapshot.Fields = projected
+	}
+	return item
 }
 
 func cloneContentItem(item *ContentItem) *ContentItem {
