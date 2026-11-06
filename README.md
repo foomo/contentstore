@@ -10,6 +10,7 @@ It provides:
 - optimistic concurrency and atomic field updates;
 - a schema registry with localized field validation and optional per-field size limits;
 - opt-in content trees (folders) with path lookups and paginated child listings;
+- opt-in weighted tags with filters, index-backed rankings and tag counts;
 - a MongoDB-backed store and an injectable persistence interface;
 - checksummed export and atomic replacement operations.
 
@@ -49,6 +50,45 @@ that aren't tree types are unaffected.
 Placement changes don't touch snapshot timestamps: moving an item, or unpublishing one of
 its ancestors, doesn't change the `UpdatedAt` of the items it affects. Use change events
 (`OpMove`, `OpUnpublish`, ...) to detect tree changes.
+
+## Tags
+
+A schema enables tags by declaring a tag policy:
+
+```go
+article.Tags = &contentstore.TagPolicy{
+	MaxTags: 20, // 0 means 100
+	Namespaces: []contentstore.TagNamespace{
+		{Name: ""}, // bare tags such as "mongodb"
+		{Name: "topic", Weighted: true, MinWeight: new(0.0), MaxWeight: new(1.0)},
+		{Name: "audience", Values: []string{"developers", "editors"}}, // closed list
+	},
+}
+```
+
+Types without a policy can't be tagged.
+
+- **Identity.** A tag is a language-neutral ID, `namespace:value` or a bare value. Labels and
+  translations belong to the application.
+- **Tags are content.** They live in the draft snapshot and publish with it. Each item has one tag
+  set, and namespaces stand in for several tag fields.
+- **Weight.** A tag's weight is how strongly the tag applies to the item. Unweighted tags weigh 1.
+  Item attributes such as ratings or scores belong in fields, not in tags.
+- **Writing.** `UpdateTags` (on `ContentTags`) is the only way to write tags: it adds, re-weights,
+  removes or replaces them. It's a compare-and-swap on the draft revision, retried on conflict.
+  Whole-document writes of tagged items compare-and-swap too, so no concurrent change is lost.
+- **Filters.** `GetSnapshot` and `ListChildren` accept a tag filter (all / any / none of a list of
+  tags).
+- **Rankings.** `ListTagged` ranks the items carrying a tag by its weight, with keyset pagination.
+  With `NewMongoStore(ctx, url, contentstore.WithTagIndexes())` the ranking is served from
+  compound wildcard indexes, which **need MongoDB 7.0 or later**. Without the option, rankings stay
+  correct but are sorted in memory.
+- **Counts.** `GetTagCounts` counts tags for facets and autocomplete (with a prefix). It counts in
+  memory over the requested types. For very large catalogues it would need an aggregation pipeline
+  or a maintained tally instead.
+
+In MongoDB, tag IDs become field names: `%`, `.` and `$` are percent-escaped, and so is the first
+character of an all-digit ID. That's transparent to callers.
 
 ## Field size limits
 
