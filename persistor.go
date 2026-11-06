@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,10 +28,28 @@ const (
 	treeLockID         = "tree"
 )
 
+// Index names of the tag rankings (see WithTagIndexes).
+const (
+	indexDraftTagsRank     = "draft_tags_rank"
+	indexPublishedTagsRank = "published_tags_rank"
+)
+
+// StoreOption configures NewMongoStore.
+type StoreOption func(*Persistor)
+
+// WithTagIndexes creates the indexes that serve tag rankings (ListTagged) from an index:
+// compound wildcard indexes on draft and published tags, which need MongoDB 7.0 or later
+// (NewMongoStore fails otherwise). Without them rankings stay correct but are sorted in
+// memory.
+func WithTagIndexes() StoreOption {
+	return func(p *Persistor) { p.tagIndexes = true }
+}
+
 // Persistor is the MongoDB-backed Store. It depends only on the mongo driver.
 type Persistor struct {
-	client *mongo.Client
-	coll   *mongo.Collection
+	client     *mongo.Client
+	coll       *mongo.Collection
+	tagIndexes bool
 
 	treeLockMu    sync.Mutex
 	treeLockReady bool
@@ -42,12 +62,15 @@ var (
 
 // NewMongoStore connects to MongoDB (database taken from the connection string) and
 // ensures the content_items indexes, returning a ready Store.
-func NewMongoStore(ctx context.Context, mongoURL string) (*Persistor, error) {
+func NewMongoStore(ctx context.Context, mongoURL string, opts ...StoreOption) (*Persistor, error) {
 	client, db, err := connect(mongoURL)
 	if err != nil {
 		return nil, err
 	}
 	p := &Persistor{client: client, coll: client.Database(db).Collection(collectionContentItems)}
+	for _, opt := range opts {
+		opt(p)
+	}
 	if err := p.ensureIndexes(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, err
@@ -59,10 +82,15 @@ func NewMongoStore(ctx context.Context, mongoURL string) (*Persistor, error) {
 func (p *Persistor) Close() error { return p.client.Disconnect(context.Background()) }
 
 func (p *Persistor) ensureIndexes(ctx context.Context) error {
-	return ensureIndexes(ctx, p.coll)
+	return ensureIndexes(ctx, p.coll, p.tagIndexes)
 }
 
-func ensureIndexes(ctx context.Context, coll *mongo.Collection) error {
+func ensureIndexes(ctx context.Context, coll *mongo.Collection, tagIndexes bool) error {
+	if tagIndexes {
+		if err := ensureTagIndexes(ctx, coll); err != nil {
+			return err
+		}
+	}
 	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		// Unique key where present (partial: excludes items with no/empty key).
 		{
@@ -151,7 +179,7 @@ func (p *Persistor) ReplaceAll(ctx context.Context, items []*ContentItem) error 
 		_ = temp.Drop(cleanupCtx)
 	}()
 
-	if err := ensureIndexes(ctx, temp); err != nil {
+	if err := ensureIndexes(ctx, temp, p.tagIndexes); err != nil {
 		return fmt.Errorf("contentstore: prepare replacement collection: %w", err)
 	}
 	if len(items) > 0 {
@@ -528,9 +556,9 @@ func childFilter(q ChildQuery) bson.D {
 		{Key: "name", Value: name},
 	}
 	switch q.Lifecycle {
-	case ChildrenLive:
+	case LifecycleLive:
 		filter = append(filter, bson.E{Key: "archivedAt", Value: nil})
-	case ChildrenPublished:
+	case LifecyclePublished:
 		filter = append(filter,
 			bson.E{Key: "published", Value: bson.D{{Key: "$ne", Value: nil}}},
 			bson.E{Key: "archivedAt", Value: nil},
@@ -539,11 +567,42 @@ func childFilter(q ChildQuery) bson.D {
 	if len(q.Types) > 0 {
 		filter = append(filter, bson.E{Key: "type", Value: bson.D{{Key: "$in", Value: q.Types}}})
 	}
-	return filter
+	return append(filter, tagFilterConditions(q.Tags, q.TagView)...)
+}
+
+// tagFilterConditions translates a tag filter on view's tags into query conditions.
+func tagFilterConditions(f *TagFilter, view SnapshotView) bson.D {
+	if f == nil {
+		return nil
+	}
+	path := func(id string) string { return snapshotPath(view) + ".tags." + escapeTagKey(id) }
+	var conditions bson.D
+	for _, id := range f.All {
+		conditions = append(conditions, bson.E{Key: path(id), Value: bson.D{{Key: "$exists", Value: true}}})
+	}
+	for _, id := range f.None {
+		conditions = append(conditions, bson.E{Key: path(id), Value: bson.D{{Key: "$exists", Value: false}}})
+	}
+	if len(f.Any) > 0 {
+		anyOf := make(bson.A, 0, len(f.Any))
+		for _, id := range f.Any {
+			anyOf = append(anyOf, bson.D{{Key: path(id), Value: bson.D{{Key: "$exists", Value: true}}}})
+		}
+		conditions = append(conditions, bson.E{Key: "$or", Value: anyOf})
+	}
+	return conditions
+}
+
+// snapshotPath is the document field holding view's snapshot.
+func snapshotPath(view SnapshotView) string {
+	if view == SnapshotViewPublished {
+		return "published"
+	}
+	return "draft"
 }
 
 // childProjection keeps everything but the snapshot field sets, of which it keeps only
-// the requested fields (none for an empty list).
+// the requested fields (none for an empty list). Tags are always kept.
 func childProjection(fields []FieldID) bson.D {
 	projection := bson.D{
 		{Key: "key", Value: 1}, {Key: "type", Value: 1}, {Key: "ownerRef", Value: 1},
@@ -551,7 +610,7 @@ func childProjection(fields []FieldID) bson.D {
 		{Key: "createdAt", Value: 1}, {Key: "updatedAt", Value: 1},
 	}
 	for _, snapshot := range []string{"draft", "published"} {
-		for _, f := range []string{"revision", "schemaVersion", "schemaHash", "createdAt", "updatedAt"} {
+		for _, f := range []string{"revision", "schemaVersion", "schemaHash", "tags", "createdAt", "updatedAt"} {
 			projection = append(projection, bson.E{Key: snapshot + "." + f, Value: 1})
 		}
 		for _, f := range fields {
@@ -595,4 +654,93 @@ func (p *Persistor) UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, 
 		return nil, fmt.Errorf("contentstore: update tags: %w", err)
 	}
 	return item, nil
+}
+
+// ensureTagIndexes creates the tag ranking indexes: a compound wildcard index per snapshot
+// whose _id suffix makes "carries tag X, by X's weight, ties by _id" an index scan,
+// including keyset pages. Documents without tags have no wildcard entries.
+func ensureTagIndexes(ctx context.Context, coll *mongo.Collection) error {
+	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "draft.tags.$**", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName(indexDraftTagsRank),
+		},
+		{
+			Keys:    bson.D{{Key: "published.tags.$**", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName(indexPublishedTagsRank),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure tag indexes (MongoDB 7.0+ required): %w", err)
+	}
+	return nil
+}
+
+// FindTagged ranks the non-archived items carrying q.Tag by its weight. The weight
+// predicate is a numeric range (not $exists) so the wildcard index can provide the order;
+// a keyset page is the union of "lower weight" and "same weight, lower _id". When tag
+// indexes are enabled the query hints the ranking index, and falls back to an unhinted
+// query (sorted in memory) if that index is missing, e.g. after a ReplaceAll by an
+// instance configured without it.
+func (p *Persistor) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error) {
+	filter, sort, projection := tagQueryParts(q)
+	opts := options.Find().SetSort(sort)
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	if projection != nil {
+		opts.SetProjection(projection)
+	}
+	if p.tagIndexes {
+		opts.SetHint(tagRankIndex(q.View))
+	}
+	cur, err := p.coll.Find(ctx, filter, opts)
+	if err != nil && p.tagIndexes && isMissingHintIndex(err) {
+		opts.SetHint(nil)
+		cur, err = p.coll.Find(ctx, filter, opts)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find tagged: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var items []*ContentItem
+	if err := cur.All(ctx, &items); err != nil {
+		return nil, fmt.Errorf("contentstore: find tagged decode: %w", err)
+	}
+	return items, nil
+}
+
+// tagQueryParts builds the filter, sort and projection (nil: everything) of a ranking page.
+func tagQueryParts(q TagQuery) (filter, sort, projection bson.D) {
+	rank := snapshotPath(q.View) + ".tags." + escapeTagKey(q.Tag)
+	filter = bson.D{{Key: "archivedAt", Value: nil}}
+	if q.After == nil {
+		filter = append(filter, bson.E{Key: rank, Value: bson.D{{Key: "$gte", Value: -math.MaxFloat64}}})
+	} else {
+		filter = append(filter, bson.E{Key: "$or", Value: bson.A{
+			bson.D{{Key: rank, Value: bson.D{{Key: "$lt", Value: q.After.Weight}}}},
+			bson.D{{Key: rank, Value: q.After.Weight}, {Key: "_id", Value: bson.D{{Key: "$lt", Value: q.After.ID}}}},
+		}})
+	}
+	if len(q.Types) > 0 {
+		filter = append(filter, bson.E{Key: "type", Value: bson.D{{Key: "$in", Value: q.Types}}})
+	}
+	sort = bson.D{{Key: rank, Value: -1}, {Key: "_id", Value: -1}}
+	if q.Fields != nil {
+		projection = childProjection(q.Fields)
+	}
+	return filter, sort, projection
+}
+
+func tagRankIndex(view SnapshotView) string {
+	if view == SnapshotViewPublished {
+		return indexPublishedTagsRank
+	}
+	return indexDraftTagsRank
+}
+
+// isMissingHintIndex reports MongoDB's error for a hint naming no existing index.
+func isMissingHintIndex(err error) bool {
+	return strings.Contains(err.Error(), "hint provided does not correspond to an existing index")
 }

@@ -1,6 +1,7 @@
 package contentstore
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -371,11 +372,13 @@ func (f *fakeStore) FindChildren(_ context.Context, q ChildQuery) ([]*ContentIte
 			continue
 		case q.Name != "" && it.Name != q.Name:
 			continue
-		case q.Lifecycle == ChildrenLive && it.ArchivedAt != nil:
+		case q.Lifecycle == LifecycleLive && it.ArchivedAt != nil:
 			continue
-		case q.Lifecycle == ChildrenPublished && (it.Published == nil || it.ArchivedAt != nil):
+		case q.Lifecycle == LifecyclePublished && (it.Published == nil || it.ArchivedAt != nil):
 			continue
 		case len(q.Types) > 0 && !containsType(q.Types, it.Type):
+			continue
+		case q.Tags != nil && !q.Tags.matches(snapshotTags(it, q.TagView)):
 			continue
 		}
 		out = append(out, projectItem(cloneContentItem(it), q.Fields))
@@ -385,6 +388,48 @@ func (f *fakeStore) FindChildren(_ context.Context, q ChildQuery) ([]*ContentIte
 		out = out[:q.Limit]
 	}
 	return out, nil
+}
+
+// FindTagged mirrors Persistor.FindTagged: weight descending, ID descending, keyset.
+func (f *fakeStore) FindTagged(_ context.Context, q TagQuery) ([]*ContentItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	weight := func(it *ContentItem) float64 { return snapshotTags(it, q.View)[q.Tag] }
+	var out []*ContentItem
+	for _, it := range f.items {
+		if _, ok := snapshotTags(it, q.View)[q.Tag]; !ok || it.ArchivedAt != nil {
+			continue
+		}
+		if len(q.Types) > 0 && !containsType(q.Types, it.Type) {
+			continue
+		}
+		if a := q.After; a != nil && (weight(it) > a.Weight || weight(it) == a.Weight && it.ID >= a.ID) {
+			continue
+		}
+		out = append(out, it)
+	}
+	slices.SortFunc(out, func(a, b *ContentItem) int {
+		return cmp.Or(cmp.Compare(weight(b), weight(a)), strings.Compare(b.ID, a.ID))
+	})
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	for i, it := range out {
+		out[i] = projectItem(cloneContentItem(it), q.Fields)
+	}
+	return out, nil
+}
+
+// snapshotTags returns the tags of item's snapshot for view.
+func snapshotTags(item *ContentItem, view SnapshotView) TagSet {
+	snapshot := item.Draft
+	if view == SnapshotViewPublished {
+		snapshot = item.Published
+	}
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.Tags
 }
 
 // projectItem mirrors the persistor's FindChildren projection.

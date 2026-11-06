@@ -14,7 +14,8 @@ import (
 const articleType ContentType = "article"
 
 // tagRegistry adds a tagged type to the tree registry: bare tags, weighted topics in
-// [0, 10] and a closed audience namespace, at most 5 tags per item.
+// [0, 10] and a closed audience namespace, at most 5 tags per item. Tree documents take
+// bare tags and weighted topics.
 func tagRegistry() *Registry {
 	r := treeRegistry()
 	article := NewSchema(articleType, "1", []FieldDefinition{{ID: "title", Type: FieldTypeSymbol}})
@@ -24,6 +25,10 @@ func tagRegistry() *Registry {
 		{Name: "audience", Values: []string{"developers", "editors"}},
 	}}
 	r.Register(article)
+	// Tree documents take tags too, so rankings can be checked against folder visibility.
+	doc, _ := r.schemaFor(documentType)
+	doc.Tags = &TagPolicy{Namespaces: []TagNamespace{{Name: ""}, {Name: "topic", Weighted: true}}}
+	r.Register(doc)
 	return r
 }
 

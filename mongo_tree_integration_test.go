@@ -14,10 +14,10 @@ import (
 
 // newMongoTreeEngine opens a tree engine over a fresh database on a local replica set.
 // Tree writes use transactions, so the tests skip on a standalone server.
-func newMongoTreeEngine(t *testing.T) (*Engine, *Persistor) {
+func newMongoTreeEngine(t *testing.T, opts ...StoreOption) (*Engine, *Persistor) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := NewMongoStore(ctx, mongoURLForTest(t))
+	store, err := NewMongoStore(ctx, mongoURLForTest(t), opts...)
 	if err != nil {
 		t.Fatalf("NewMongoStore: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestTreeWritesInMongo(t *testing.T) {
 	if children[1].Draft == nil || children[1].Draft.Revision != 1 || children[1].Draft.Fields != nil {
 		t.Fatalf("structure-only projection must keep revisions and drop fields: %+v", children[1].Draft)
 	}
-	roots, err := store.FindChildren(ctx, ChildQuery{Lifecycle: ChildrenLive})
+	roots, err := store.FindChildren(ctx, ChildQuery{Lifecycle: LifecycleLive})
 	if err != nil || len(roots) != 1 || roots[0].ID != kb.ID {
 		t.Fatalf("root children = %v, err = %v", roots, err)
 	}
@@ -177,7 +177,7 @@ func TestTreeCreateRacesArchiveInMongo(t *testing.T) {
 			func() error { _, err := e.Archive(ctx, ContentItemMatch{ID: folder.ID}); return err },
 		)
 		archived := getItem(t, e, folder.ID).ArchivedAt != nil
-		children, err := e.tree.FindChildren(ctx, ChildQuery{ParentID: folder.ID, Lifecycle: ChildrenLive, Fields: []FieldID{}})
+		children, err := e.tree.FindChildren(ctx, ChildQuery{ParentID: folder.ID, Lifecycle: LifecycleLive, Fields: []FieldID{}})
 		if err != nil {
 			t.Fatalf("children: %v", err)
 		}

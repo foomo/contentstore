@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
+	"strings"
 	"testing"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -129,5 +131,160 @@ func TestTagWritesRaceDraftWritesInMongo(t *testing.T) {
 		if got.Draft.Tags[tag] != 1 || got.Draft.Fields["title"]["de"] != "v2" || got.Draft.Revision != 3 {
 			t.Fatalf("round %d: lost a write: tags=%v title=%v revision=%d", round, got.Draft.Tags, got.Draft.Fields["title"], got.Draft.Revision)
 		}
+	}
+}
+
+// planStages returns the stages of the winning plan of an explained find command.
+func planStages(t *testing.T, store *Persistor, find bson.D) []string {
+	t.Helper()
+	var res bson.M
+	cmd := bson.D{{Key: "explain", Value: find}, {Key: "verbosity", Value: "queryPlanner"}}
+	if err := store.coll.Database().RunCommand(context.Background(), cmd).Decode(&res); err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	plan := res["queryPlanner"].(bson.M)["winningPlan"].(bson.M)
+	if inner, ok := plan["queryPlan"].(bson.M); ok {
+		plan = inner
+	}
+	var stages []string
+	var walk func(bson.M)
+	walk = func(n bson.M) {
+		stage := fmt.Sprint(n["stage"])
+		if index, ok := n["indexName"]; ok {
+			stage += "(" + fmt.Sprint(index) + ")"
+		}
+		stages = append(stages, stage)
+		if in, ok := n["inputStage"].(bson.M); ok {
+			walk(in)
+		}
+		if ins, ok := n["inputStages"].(bson.A); ok {
+			for _, in := range ins {
+				walk(in.(bson.M))
+			}
+		}
+	}
+	walk(plan)
+	return stages
+}
+
+// tagRankedArticles creates published articles tagged topic:a (weight i) and 2024 (weight
+// i%3, many ties), returning their IDs.
+func tagRankedArticles(t *testing.T, e *Engine, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	ids := make([]string, 0, n)
+	for i := range n {
+		item := newArticle(t, e)
+		updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: item.ID}, Set: map[string]*float64{
+			"topic:a": new(float64(i % 10)), "2024": nil, "topic:node.js": new(float64(i % 3)),
+		}})
+		if _, err := e.Publish(ctx, ContentItemMatch{ID: item.ID}); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+// TestTagRankingIsIndexBackedInMongo asserts that the ranking query FindTagged sends never
+// needs a blocking sort with tag indexes enabled: first and keyset pages, both views,
+// with and without a type condition, for namespaced, dotted and all-digit tags.
+func TestTagRankingIsIndexBackedInMongo(t *testing.T) {
+	e, store := newMongoTreeEngine(t, WithTagIndexes())
+	tagRankedArticles(t, e, 20)
+	for _, view := range []SnapshotView{SnapshotViewPublished, SnapshotViewPreview} {
+		for _, tag := range []string{"topic:a", "2024", "topic:node.js"} {
+			for _, after := range []*TagCursor{nil, {Weight: 1, ID: "id-5"}} {
+				for _, types := range [][]ContentType{nil, {articleType}} {
+					q := TagQuery{Tag: tag, View: view, Types: types, After: after, Fields: []FieldID{"title"}, Limit: 10}
+					filter, sort, projection := tagQueryParts(q)
+					find := bson.D{
+						{Key: "find", Value: collectionContentItems}, {Key: "filter", Value: filter}, {Key: "sort", Value: sort},
+						{Key: "projection", Value: projection}, {Key: "limit", Value: 10}, {Key: "hint", Value: tagRankIndex(view)},
+					}
+					stages := planStages(t, store, find)
+					if slices.Contains(stages, "SORT") || !slices.ContainsFunc(stages, func(s string) bool { return strings.HasPrefix(s, "IXSCAN("+tagRankIndex(view)) }) {
+						t.Errorf("view=%s tag=%s after=%v types=%v: plan %v needs an in-memory sort", view, tag, after, types, stages)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestListTaggedInMongo(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newMongoTreeEngine(t, WithTagIndexes())
+	ids := tagRankedArticles(t, e, 12)
+
+	for _, tag := range []string{"topic:node.js", "2024"} {
+		got := walkRanking(t, e, SnapshotViewPublished, ListTaggedInput{Tag: tag, Limit: 5})
+		if len(got) != len(ids) {
+			t.Fatalf("%s: ranking has %d items, want %d", tag, len(got), len(ids))
+		}
+		page, err := e.ListTagged(ctx, SnapshotViewPublished, ListTaggedInput{Tag: tag, Limit: 12})
+		if err != nil {
+			t.Fatalf("%s: %v", tag, err)
+		}
+		for i := 1; i < len(page.Items); i++ {
+			prev, cur := page.Items[i-1], page.Items[i]
+			if pw, cw := prev.Tags[tag], cur.Tags[tag]; pw < cw || (pw == cw && prev.ID < cur.ID) {
+				t.Fatalf("%s: %s (%v) ranks before %s (%v)", tag, prev.ID, pw, cur.ID, cw)
+			}
+		}
+	}
+
+	kb := place(t, e, folderType, "", "kb")
+	doc := place(t, e, documentType, kb.ID, "doc")
+	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: doc.ID}, Set: map[string]*float64{"topic:a": new(1000.0)}})
+	if _, err := e.Publish(ctx, ContentItemMatch{ID: doc.ID}); err != nil {
+		t.Fatalf("publish doc: %v", err)
+	}
+	page, err := e.ListTagged(ctx, SnapshotViewPublished, ListTaggedInput{Tag: "topic:a", Limit: 1})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID == doc.ID {
+		t.Fatalf("a document under an unpublished folder must not rank: %+v, %v", page, err)
+	}
+	children, err := e.ListChildren(ctx, SnapshotViewPreview, ListChildrenInput{ParentID: kb.ID, Tags: &TagFilter{All: []string{"topic:a"}}})
+	if err != nil || len(children.Items) != 1 {
+		t.Fatalf("children tag filter: %+v, %v", children, err)
+	}
+	children, err = e.ListChildren(ctx, SnapshotViewPreview, ListChildrenInput{ParentID: kb.ID, Tags: &TagFilter{None: []string{"topic:a"}}})
+	if err != nil || len(children.Items) != 0 {
+		t.Fatalf("children tag filter (none): %+v, %v", children, err)
+	}
+}
+
+func TestTagIndexesSurviveReplaceAllInMongo(t *testing.T) {
+	ctx := context.Background()
+	e, store := newMongoTreeEngine(t, WithTagIndexes())
+	tagRankedArticles(t, e, 3)
+	items, err := store.ExportAll(ctx)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if err := store.ReplaceAll(ctx, items); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	specs, err := store.coll.Indexes().ListSpecifications(ctx)
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	var names []string
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	for _, want := range []string{indexDraftTagsRank, indexPublishedTagsRank} {
+		if !slices.Contains(names, want) {
+			t.Fatalf("indexes after ReplaceAll = %v, missing %s", names, want)
+		}
+	}
+
+	// Without the ranking index the hinted query falls back to an unhinted one.
+	if err := store.coll.Indexes().DropOne(ctx, indexPublishedTagsRank); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	got := walkRanking(t, e, SnapshotViewPublished, ListTaggedInput{Tag: "topic:a"})
+	if len(got) != 3 {
+		t.Fatalf("ranking without its index = %v", got)
 	}
 }

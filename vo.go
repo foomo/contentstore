@@ -160,10 +160,19 @@ type SetFieldValueInput struct {
 }
 
 // SnapshotInput narrows a consumer snapshot by content type and, optionally,
-// exact owner. Empty filters return every item visible in the configured view.
+// exact owner and tags. Empty filters return every item visible in the configured view.
 type SnapshotInput struct {
 	Types    []ContentType `json:"types,omitempty"`
 	OwnerRef *OwnerRef     `json:"ownerRef,omitempty"`
+	Tags     *TagFilter    `json:"tags,omitempty"`
+}
+
+// TagFilter selects items by the tags of the read view: every tag in All, at least one
+// tag in Any (when set) and no tag in None.
+type TagFilter struct {
+	All  []string `json:"all,omitempty"`
+	Any  []string `json:"any,omitempty"`
+	None []string `json:"none,omitempty"`
 }
 
 // Snapshot is the common bulk-read shape for published and preview consumers.
@@ -241,15 +250,50 @@ type UpdateTagsInput struct {
 type ListChildrenInput struct {
 	ParentID string        `json:"parentId,omitempty"`
 	Types    []ContentType `json:"types,omitempty"`
+	Tags     *TagFilter    `json:"tags,omitempty"`
 	Fields   []FieldID     `json:"fields,omitempty"`
 	Limit    int           `json:"limit,omitempty"`
 	Cursor   string        `json:"cursor,omitempty"`
 }
 
-// ChildrenPage is one page of ListChildren. NextCursor is empty on the last page.
-type ChildrenPage struct {
+// ItemPage is one page of ListChildren or ListTagged. NextCursor is empty on the last page.
+type ItemPage struct {
 	Items      []SnapshotItem `json:"items"`
 	NextCursor string         `json:"nextCursor,omitempty"`
+}
+
+// ListTaggedInput ranks the items carrying Tag by its weight, highest first (ties by
+// descending ID). Types and Filter narrow the items, Fields projects their field sets (all
+// fields when empty). Limit defaults to 100 and may be at most 1000; Cursor continues from
+// a previous page's NextCursor. A page can come back short, with a NextCursor, when many
+// ranked items are hidden by Filter or by unpublished ancestors.
+type ListTaggedInput struct {
+	Tag    string        `json:"tag"`
+	Types  []ContentType `json:"types,omitempty"`
+	Filter *TagFilter    `json:"filter,omitempty"`
+	Fields []FieldID     `json:"fields,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
+// TagCountsInput counts the tags of the items visible in a view, for facets and
+// autocomplete. Types defaults to every type that takes tags; Prefix narrows the tags
+// (e.g. "topic:da"); Limit defaults to 20 and may be at most 1000.
+type TagCountsInput struct {
+	Types  []ContentType `json:"types,omitempty"`
+	Prefix string        `json:"prefix,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+}
+
+// TagCounts lists tags by how many items carry them, most used first (ties by ID).
+type TagCounts struct {
+	Items []TagCount `json:"items"`
+}
+
+// TagCount is the number of items carrying one tag.
+type TagCount struct {
+	ID    string `json:"id"`
+	Count int    `json:"count"`
 }
 
 // TreeItemInput addresses one item either by Match or by Path ("/kb/tables/users", the

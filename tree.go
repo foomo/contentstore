@@ -16,7 +16,7 @@ import (
 // ContentStore so existing implementations of that interface keep compiling.
 type ContentTree interface {
 	Move(ctx context.Context, input MoveInput) (*ContentItem, error)
-	ListChildren(ctx context.Context, view SnapshotView, input ListChildrenInput) (*ChildrenPage, error)
+	ListChildren(ctx context.Context, view SnapshotView, input ListChildrenInput) (*ItemPage, error)
 	GetTreeItem(ctx context.Context, view SnapshotView, input TreeItemInput) (*TreeItem, error)
 }
 
@@ -237,7 +237,7 @@ func (e *Engine) ancestors(ctx context.Context, item *ContentItem) ([]*ContentIt
 }
 
 // rejectChildren fails when item has children in the given lifecycle states.
-func (e *Engine) rejectChildren(ctx context.Context, item *ContentItem, lifecycle ChildLifecycle, hint string) error {
+func (e *Engine) rejectChildren(ctx context.Context, item *ContentItem, lifecycle Lifecycle, hint string) error {
 	children, err := e.tree.FindChildren(ctx, ChildQuery{ParentID: item.ID, Lifecycle: lifecycle, Fields: []FieldID{}, Limit: 1})
 	if err != nil {
 		return internalErr(err, "load children failed")
@@ -273,7 +273,7 @@ func (e *Engine) deleteTreeItem(ctx context.Context, match ContentItemMatch) (bo
 		if err != nil || item == nil {
 			return err
 		}
-		if err := e.rejectChildren(ctx, item, ChildrenAny, "delete or move its children first"); err != nil {
+		if err := e.rejectChildren(ctx, item, LifecycleAny, "delete or move its children first"); err != nil {
 			return err
 		}
 		if err := e.store.Delete(ctx, item.ID); err != nil {

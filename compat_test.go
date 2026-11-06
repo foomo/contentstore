@@ -204,6 +204,11 @@ func (r *recordingStore) UpdateTags(ctx context.Context, u TagUpdate) (*ContentI
 	return r.inner.UpdateTags(ctx, u)
 }
 
+func (r *recordingStore) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error) {
+	r.record("FindTagged(%+v)", q)
+	return r.inner.FindTagged(ctx, q)
+}
+
 // compatStep is one ContentStore operation of the legacy-type scenario.
 type compatStep struct {
 	name string

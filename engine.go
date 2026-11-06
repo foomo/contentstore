@@ -350,7 +350,7 @@ func rejectArchived(item *ContentItem) error {
 func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
 	item, _, err := e.write(ctx, match, "archive failed", func(ctx context.Context, item *ContentItem) (bool, error) {
 		if e.onTree(item) {
-			if err := e.rejectChildren(ctx, item, ChildrenLive, "archive its children first"); err != nil {
+			if err := e.rejectChildren(ctx, item, LifecycleLive, "archive its children first"); err != nil {
 				return false, err
 			}
 		}
@@ -434,6 +434,9 @@ func (e *Engine) GetItem(ctx context.Context, match ContentItemMatch) (*ContentI
 // reads never expose working drafts; preview reads expose the latest draft and
 // derived lifecycle state.
 func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input SnapshotInput) (*Snapshot, error) {
+	if err := input.Tags.validate(); err != nil {
+		return nil, err
+	}
 	var (
 		items []*ContentItem
 		err   error
@@ -462,7 +465,7 @@ func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input Snaps
 		// Defensive skip: FindPublished only returns published items and a non-archived
 		// item always has a draft.
 		snapshotItem, ok := toSnapshotItem(view, item)
-		if !ok {
+		if !ok || !input.Tags.matches(snapshotItem.Tags) {
 			continue
 		}
 		snapshot.Items = append(snapshot.Items, snapshotItem)

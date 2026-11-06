@@ -12,6 +12,8 @@ import (
 // ContentStore so existing implementations of that interface keep compiling.
 type ContentTags interface {
 	UpdateTags(ctx context.Context, input UpdateTagsInput) (*ContentItem, error)
+	ListTagged(ctx context.Context, view SnapshotView, input ListTaggedInput) (*ItemPage, error)
+	GetTagCounts(ctx context.Context, view SnapshotView, input TagCountsInput) (*TagCounts, error)
 }
 
 var _ ContentTags = (*Engine)(nil)

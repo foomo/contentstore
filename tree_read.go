@@ -18,8 +18,8 @@ const (
 // items) visible in view, ordered by name. In the published view an item is visible while
 // it and all its ancestors are published and not archived; in the preview view while none
 // of them is archived. A parent that is not visible is reported as not found.
-func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input ListChildrenInput) (*ChildrenPage, error) {
-	lifecycle, err := childLifecycle(view)
+func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input ListChildrenInput) (*ItemPage, error) {
+	lifecycle, err := viewLifecycle(view)
 	if err != nil {
 		return nil, err
 	}
@@ -36,6 +36,9 @@ func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input List
 	}
 	fields, err := e.projection(input.Types, input.Fields)
 	if err != nil {
+		return nil, err
+	}
+	if err := input.Tags.validate(); err != nil {
 		return nil, err
 	}
 	if e.tree == nil {
@@ -56,13 +59,15 @@ func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input List
 		AfterName: afterName,
 		Lifecycle: lifecycle,
 		Types:     input.Types,
+		Tags:      input.Tags,
+		TagView:   view,
 		Fields:    fields,
 		Limit:     limit + 1,
 	})
 	if err != nil {
 		return nil, internalErr(err, "list children failed")
 	}
-	page := &ChildrenPage{Items: make([]SnapshotItem, 0, min(len(children), limit))}
+	page := &ItemPage{Items: make([]SnapshotItem, 0, min(len(children), limit))}
 	if len(children) > limit {
 		children = children[:limit]
 		page.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(children[limit-1].Name))
@@ -78,7 +83,7 @@ func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input List
 // GetTreeItem returns one item visible in view, addressed by match or by path, with its
 // ancestors and path. An item that is not visible (see ListChildren) is not found.
 func (e *Engine) GetTreeItem(ctx context.Context, view SnapshotView, input TreeItemInput) (*TreeItem, error) {
-	lifecycle, err := childLifecycle(view)
+	lifecycle, err := viewLifecycle(view)
 	if err != nil {
 		return nil, err
 	}
@@ -193,12 +198,12 @@ func visibleIn(view SnapshotView, item *ContentItem) bool {
 	return view != SnapshotViewPublished || item.Published != nil
 }
 
-func childLifecycle(view SnapshotView) (ChildLifecycle, error) {
+func viewLifecycle(view SnapshotView) (Lifecycle, error) {
 	switch view {
 	case SnapshotViewPublished:
-		return ChildrenPublished, nil
+		return LifecyclePublished, nil
 	case SnapshotViewPreview:
-		return ChildrenLive, nil
+		return LifecycleLive, nil
 	default:
 		return 0, badRequest(fmt.Sprintf("unsupported snapshot view %q", view))
 	}

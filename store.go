@@ -59,16 +59,16 @@ type TreeStore interface {
 	FindChildren(ctx context.Context, q ChildQuery) ([]*ContentItem, error)
 }
 
-// ChildLifecycle selects the lifecycle states FindChildren returns.
-type ChildLifecycle int
+// Lifecycle selects the lifecycle states a query returns.
+type Lifecycle int
 
 const (
-	// ChildrenAny returns children in every state, archived included.
-	ChildrenAny ChildLifecycle = iota
-	// ChildrenLive returns non-archived children.
-	ChildrenLive
-	// ChildrenPublished returns published, non-archived children.
-	ChildrenPublished
+	// LifecycleAny returns items in every state, archived included.
+	LifecycleAny Lifecycle = iota
+	// LifecycleLive returns non-archived items.
+	LifecycleLive
+	// LifecyclePublished returns published, non-archived items.
+	LifecyclePublished
 )
 
 // ChildQuery selects the children of one parent.
@@ -79,9 +79,13 @@ type ChildQuery struct {
 	Name string
 	// AfterName selects children whose name sorts after it (keyset pagination).
 	AfterName string
-	Lifecycle ChildLifecycle
+	Lifecycle Lifecycle
 	// Types narrows the children by content type (all when empty).
 	Types []ContentType
+	// Tags narrows the children by the tags of TagView's snapshot (draft tags for the
+	// preview view, published tags for the published one).
+	Tags    *TagFilter
+	TagView SnapshotView
 	// Fields projects the draft and published field sets: nil keeps every field, an empty
 	// slice keeps none (structure, placement, lifecycle and revisions only).
 	Fields []FieldID
@@ -98,6 +102,28 @@ type TagStore interface {
 	// the item is not archived and its stored draft revision is u.ExpectedRevision. It
 	// returns ErrConflict otherwise, including when the item no longer exists.
 	UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, error)
+	// FindTagged returns non-archived items carrying q.Tag in q.View's snapshot, ranked by
+	// its weight (highest first, ties by descending ID) after the keyset position q.After.
+	// Results can be projected (see ChildQuery.Fields) and must then never be written back.
+	FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error)
+}
+
+// TagQuery selects one page of a tag ranking.
+type TagQuery struct {
+	Tag string
+	// View selects the ranked snapshot: published tags of published items, or draft tags.
+	View  SnapshotView
+	Types []ContentType
+	// After continues the ranking after this position (from the start when nil).
+	After  *TagCursor
+	Fields []FieldID
+	Limit  int
+}
+
+// TagCursor is a position in a tag ranking: the weight and ID of the last item seen.
+type TagCursor struct {
+	Weight float64 `json:"w"`
+	ID     string  `json:"id"`
 }
 
 // TagUpdate is a compare-and-swap write of an item's complete draft tag set.
