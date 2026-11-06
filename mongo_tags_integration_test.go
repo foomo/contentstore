@@ -284,7 +284,7 @@ func TestTagIndexesSurviveReplaceAllInMongo(t *testing.T) {
 		t.Fatalf("drop index: %v", err)
 	}
 	got := walkRanking(t, e, SnapshotViewPublished, ListTaggedInput{Tag: "topic:a"})
-	if len(got) != 3 {
-		t.Fatalf("ranking without its index = %v", got)
+	if len(got) != 3 || !store.tagHintMissing.Load() {
+		t.Fatalf("ranking without its index = %v (hint dropped: %v)", got, store.tagHintMissing.Load())
 	}
 }

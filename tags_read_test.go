@@ -291,3 +291,75 @@ func TestGetTagCounts(t *testing.T) {
 	_, err = e.GetTagCounts(ctx, SnapshotViewPreview, TagCountsInput{Limit: -1})
 	wantKind(t, err, KindBadRequest)
 }
+
+// countingTagStore counts FindTagged round trips.
+type countingTagStore struct {
+	*fakeStore
+	findTagged int
+}
+
+func (c *countingTagStore) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error) {
+	c.findTagged++
+	return c.fakeStore.FindTagged(ctx, q)
+}
+
+// TestListTaggedFetchesPageSizedBatches: a nearly full page followed by many hidden rows
+// must not be refilled a row or two per round trip.
+func TestListTaggedFetchesPageSizedBatches(t *testing.T) {
+	store := &countingTagStore{fakeStore: newFakeStore()}
+	e := newTagEngine(store)
+	ids := rankedArticles(t, e, "10", "9.9", "9.8", "9.7")
+	for i := range 30 { // hidden by the filter
+		item := newArticle(t, e)
+		updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: item.ID}, Set: map[string]*float64{"topic:db": new(9 - float64(i)/10), "audience:editors": nil}})
+	}
+	ids = append(ids, rankedArticles(t, e, "1")...)
+
+	store.findTagged = 0
+	page, err := e.ListTagged(context.Background(), SnapshotViewPreview, ListTaggedInput{Tag: "topic:db", Limit: 5, Filter: &TagFilter{None: []string{"audience:editors"}}})
+	if err != nil || !slices.Equal(pageIDs(page), ids) {
+		t.Fatalf("page = %v, %v; want %v", pageIDs(page), err, ids)
+	}
+	if store.findTagged > 8 {
+		t.Fatalf("one page took %d round trips", store.findTagged)
+	}
+}
+
+// ignoringTagFilterStore is a TreeStore that ignores ChildQuery.Tags.
+type ignoringTagFilterStore struct{ *fakeStore }
+
+func (s ignoringTagFilterStore) FindChildren(ctx context.Context, q ChildQuery) ([]*ContentItem, error) {
+	q.Tags = nil
+	return s.fakeStore.FindChildren(ctx, q)
+}
+
+func TestListChildrenEnforcesTagFilter(t *testing.T) {
+	ctx := context.Background()
+	e := newTagEngine(ignoringTagFilterStore{newFakeStore()})
+	kb := place(t, e, folderType, "", "kb")
+	tagged := place(t, e, documentType, kb.ID, "tagged")
+	place(t, e, documentType, kb.ID, "plain")
+	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: tagged.ID}, Set: map[string]*float64{"go": nil}})
+	page, err := e.ListChildren(ctx, SnapshotViewPreview, ListChildrenInput{ParentID: kb.ID, Tags: &TagFilter{All: []string{"go"}}})
+	if err != nil || !slices.Equal(names2(page), []string{"tagged"}) {
+		t.Fatalf("children = %v, %v", names2(page), err)
+	}
+}
+
+// TestFilteredSnapshotRevisionSeesItemsLeavingTheFilter: the revision fingerprints the items
+// before tag filtering, so untagging an item changes it even though the item drops out.
+func TestFilteredSnapshotRevisionSeesItemsLeavingTheFilter(t *testing.T) {
+	ctx := context.Background()
+	e := newTagEngine(newFakeStore())
+	ids := rankedArticles(t, e, "1", "2")
+	input := SnapshotInput{Types: []ContentType{articleType}, Tags: &TagFilter{All: []string{"go"}}}
+	before, err := e.GetSnapshot(ctx, SnapshotViewPreview, input)
+	if err != nil || len(before.Items) != 2 {
+		t.Fatalf("before: %+v, %v", before, err)
+	}
+	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: ids[0]}, Remove: []string{"go"}})
+	after, err := e.GetSnapshot(ctx, SnapshotViewPreview, input)
+	if err != nil || len(after.Items) != 1 || after.Revision == before.Revision {
+		t.Fatalf("after: %d items, revision %d (before %d), %v", len(after.Items), after.Revision, before.Revision, err)
+	}
+}

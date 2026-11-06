@@ -9,6 +9,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -50,6 +51,9 @@ type Persistor struct {
 	client     *mongo.Client
 	coll       *mongo.Collection
 	tagIndexes bool
+	// tagHintMissing records that a ranking index was missing, so later rankings skip the
+	// hint instead of failing it first.
+	tagHintMissing atomic.Bool
 
 	treeLockMu    sync.Mutex
 	treeLockReady bool
@@ -679,9 +683,9 @@ func ensureTagIndexes(ctx context.Context, coll *mongo.Collection) error {
 // FindTagged ranks the non-archived items carrying q.Tag by its weight. The weight
 // predicate is a numeric range (not $exists) so the wildcard index can provide the order;
 // a keyset page is the union of "lower weight" and "same weight, lower _id". When tag
-// indexes are enabled the query hints the ranking index, and falls back to an unhinted
-// query (sorted in memory) if that index is missing, e.g. after a ReplaceAll by an
-// instance configured without it.
+// indexes are enabled the query hints the ranking index; if that index is missing (e.g.
+// after a ReplaceAll by an instance configured without it) it falls back to unhinted
+// queries for the rest of the Persistor's life.
 func (p *Persistor) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error) {
 	filter, sort, projection := tagQueryParts(q)
 	opts := options.Find().SetSort(sort)
@@ -691,11 +695,13 @@ func (p *Persistor) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem,
 	if projection != nil {
 		opts.SetProjection(projection)
 	}
-	if p.tagIndexes {
+	hinted := p.tagIndexes && !p.tagHintMissing.Load()
+	if hinted {
 		opts.SetHint(tagRankIndex(q.View))
 	}
 	cur, err := p.coll.Find(ctx, filter, opts)
-	if err != nil && p.tagIndexes && isMissingHintIndex(err) {
+	if err != nil && hinted && isMissingHintIndex(err) {
+		p.tagHintMissing.Store(true)
 		opts.SetHint(nil)
 		cur, err = p.coll.Find(ctx, filter, opts)
 	}

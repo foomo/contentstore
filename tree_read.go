@@ -73,7 +73,9 @@ func (e *Engine) ListChildren(ctx context.Context, view SnapshotView, input List
 		page.NextCursor = base64.RawURLEncoding.EncodeToString([]byte(children[limit-1].Name))
 	}
 	for _, child := range children {
-		if item, ok := toTreeSnapshotItem(view, child); ok {
+		// The store filters by tags; checking again keeps a store that ignores the filter
+		// from widening the result.
+		if item, ok := toTreeSnapshotItem(view, child); ok && input.Tags.matches(item.Tags) {
 			page.Items = append(page.Items, item)
 		}
 	}

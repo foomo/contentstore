@@ -99,24 +99,31 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 // saveTaggedDraft is SaveDraft for an existing item that takes tags: the draft is replaced
 // only if its revision is still the loaded one, retrying from a fresh load otherwise, so
 // a concurrent targeted write (UpdateTags, SetFieldValue) is never overwritten.
-func (e *Engine) saveTaggedDraft(ctx context.Context, input SaveDraftInput, item *ContentItem) (*ContentItem, error) {
-	for attempt := 1; ; attempt++ {
+func (e *Engine) saveTaggedDraft(ctx context.Context, input SaveDraftInput, loaded *ContentItem) (*ContentItem, error) {
+	item, err := retryConflicts(func() (*ContentItem, bool, error) {
+		item := loaded
+		loaded = nil // later attempts reload
+		if item == nil {
+			var err error
+			if item, _, err = e.resolveForSave(ctx, input); err != nil {
+				return nil, false, err
+			}
+		}
 		var expected *int64
 		if item.Draft != nil {
 			expected = new(item.Draft.Revision)
 		}
 		err := e.saveDraft(ctx, item, input, expected)
-		if err == nil {
-			e.emit(item, OpSaveDraft)
-			return item, nil
+		if typed, ok := errors.AsType[*Error](err); ok && typed.Kind == KindConflict {
+			return nil, true, nil
 		}
-		if typed, ok := errors.AsType[*Error](err); !ok || typed.Kind != KindConflict || attempt == maxWriteAttempts {
-			return nil, err
-		}
-		if item, _, err = e.resolveForSave(ctx, input); err != nil {
-			return nil, err
-		}
+		return item, false, err
+	})
+	if err != nil {
+		return nil, err
 	}
+	e.emit(item, OpSaveDraft)
+	return item, nil
 }
 
 // saveDraft validates input.Fields against the item's type and writes them as the item's
@@ -276,9 +283,6 @@ func (e *Engine) publish(_ context.Context, item *ContentItem) (bool, error) {
 		return false, notAcceptable("nothing to publish: item has no draft")
 	}
 	if err := e.validatePublish(item.Type, item.Draft.Fields); err != nil {
-		return false, err
-	}
-	if err := e.validatePublishTags(item.Type, item.Draft.Tags); err != nil {
 		return false, err
 	}
 	// Concurrent SetFieldValue calls are checked against the draft each one read, so
@@ -465,13 +469,18 @@ func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input Snaps
 		// Defensive skip: FindPublished only returns published items and a non-archived
 		// item always has a draft.
 		snapshotItem, ok := toSnapshotItem(view, item)
-		if !ok || !input.Tags.matches(snapshotItem.Tags) {
+		if !ok {
 			continue
 		}
-		snapshot.Items = append(snapshot.Items, snapshotItem)
+		// The revision covers the items before tag filtering, so an item that stops
+		// matching the filter still changes it.
 		if revision := snapshotItem.UpdatedAt.UnixNano(); revision > snapshot.Revision {
 			snapshot.Revision = revision
 		}
+		if !input.Tags.matches(snapshotItem.Tags) {
+			continue
+		}
+		snapshot.Items = append(snapshot.Items, snapshotItem)
 	}
 	return snapshot, nil
 }

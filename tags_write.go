@@ -30,8 +30,9 @@ func (e *Engine) UpdateTags(ctx context.Context, input UpdateTagsInput) (*Conten
 		return nil, badRequest("remove cannot be combined with replace")
 	}
 	for _, id := range input.Remove {
-		if err := validateTagID(id); err != nil {
-			return nil, badRequest(err.Error())
+		// Removal takes any stored key, so a malformed imported tag can still be dropped.
+		if id == "" {
+			return nil, badRequest("removed tag IDs must not be empty")
 		}
 		if _, ok := input.Set[id]; ok {
 			return nil, badRequest(fmt.Sprintf("tag %q is both set and removed", id))
@@ -40,16 +41,17 @@ func (e *Engine) UpdateTags(ctx context.Context, input UpdateTagsInput) (*Conten
 	if e.tags == nil {
 		return nil, internalErr(nil, "store does not support tags")
 	}
-	for attempt := 1; ; attempt++ {
+	var written bool
+	item, err := retryConflicts(func() (*ContentItem, bool, error) {
 		item, err := e.loadByMatch(ctx, input.Match)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if err := rejectArchived(item); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if item.Draft == nil {
-			return nil, notAcceptable("item has no draft")
+			return nil, false, notAcceptable("item has no draft")
 		}
 		schema, ok := e.schemas.schemaFor(item.Type)
 		if !ok {
@@ -57,10 +59,10 @@ func (e *Engine) UpdateTags(ctx context.Context, input UpdateTagsInput) (*Conten
 		}
 		tags, err := mergeTags(schema, item.Draft.Tags, input)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if maps.Equal(tags, item.Draft.Tags) {
-			return item, nil
+			return item, false, nil
 		}
 		updated, err := e.tags.UpdateTags(ctx, TagUpdate{
 			ID:               item.ID,
@@ -70,17 +72,22 @@ func (e *Engine) UpdateTags(ctx context.Context, input UpdateTagsInput) (*Conten
 			SchemaHash:       schema.Hash,
 			Now:              time.Now().UTC(),
 		})
-		if err == nil {
-			e.emit(updated, OpSaveDraft)
-			return updated, nil
+		if errors.Is(err, ErrConflict) {
+			return nil, true, nil
 		}
-		if !errors.Is(err, ErrConflict) {
-			return nil, internalErr(err, "update tags failed")
+		if err != nil {
+			return nil, false, internalErr(err, "update tags failed")
 		}
-		if attempt == maxWriteAttempts {
-			return nil, conflict("item keeps changing concurrently: retry later")
-		}
+		written = true
+		return updated, false, nil
+	})
+	if err != nil {
+		return nil, err
 	}
+	if written {
+		e.emit(item, OpSaveDraft)
+	}
+	return item, nil
 }
 
 // mergeTags computes an item's new tag set: the current tags (unless replacing) without the

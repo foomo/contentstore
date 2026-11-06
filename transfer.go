@@ -80,6 +80,9 @@ func validateContentExport(export ContentExport) error {
 	if err := validateContentTree(export.Items); err != nil {
 		return err
 	}
+	if err := validateContentTags(export.Items); err != nil {
+		return err
+	}
 	checksum, err := contentItemsChecksum(export.Items)
 	if err != nil {
 		return fmt.Errorf("calculate content export checksum: %w", err)
@@ -166,6 +169,27 @@ func validateContentTree(items []*ContentItem) error {
 		}
 		for id := range seen {
 			acyclic[id] = true
+		}
+	}
+	return nil
+}
+
+// validateContentTags checks the tags an import would store: valid tag IDs and finite
+// weights. The type's tag policy is not checked, just as fields are not re-validated.
+func validateContentTags(items []*ContentItem) error {
+	for _, item := range items {
+		for _, snapshot := range []*ContentSnapshot{item.Draft, item.Published} {
+			if snapshot == nil {
+				continue
+			}
+			for id, weight := range snapshot.Tags {
+				if err := validateTagID(id); err != nil {
+					return fmt.Errorf("content export item %q: %w", item.ID, err)
+				}
+				if !isFinite(weight) {
+					return fmt.Errorf("content export item %q: tag %q has a non-finite weight", item.ID, id)
+				}
+			}
 		}
 	}
 	return nil

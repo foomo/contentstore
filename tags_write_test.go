@@ -108,7 +108,7 @@ func TestUpdateTagsRejects(t *testing.T) {
 		{"empty match", UpdateTagsInput{Set: map[string]*float64{"go": nil}}, KindBadRequest},
 		{"replace with remove", UpdateTagsInput{Match: match, Replace: true, Remove: []string{"go"}}, KindBadRequest},
 		{"set and remove the same tag", UpdateTagsInput{Match: match, Set: map[string]*float64{"go": nil}, Remove: []string{"go"}}, KindBadRequest},
-		{"invalid removed tag", UpdateTagsInput{Match: match, Remove: []string{"topic:"}}, KindBadRequest},
+		{"empty removed tag", UpdateTagsInput{Match: match, Remove: []string{""}}, KindBadRequest},
 		{"type without tags", UpdateTagsInput{Match: ContentItemMatch{ID: legacy.ID}, Set: map[string]*float64{"go": nil}}, KindBadRequest},
 		{"closed namespace", UpdateTagsInput{Match: match, Set: map[string]*float64{"audience:managers": nil}}, KindBadRequest},
 		{"weight on an unweighted namespace", UpdateTagsInput{Match: match, Set: map[string]*float64{"go": new(2.0)}}, KindBadRequest},
@@ -127,6 +127,13 @@ func TestUpdateTagsRejects(t *testing.T) {
 	// An item over the limit (e.g. after MaxTags was lowered) can still shed and re-weigh tags.
 	seedTags(t, store, full.ID, TagSet{"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "topic:x": 1})
 	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: full.ID}, Set: map[string]*float64{"topic:x": new(3.0)}, Remove: []string{"a"}})
+
+	// A malformed stored tag (e.g. from an old import) can still be removed by its key.
+	seedTags(t, store, item.ID, TagSet{"topic: x ": 1, "go": 1})
+	got := updateTags(t, e, UpdateTagsInput{Match: match, Remove: []string{"topic: x "}})
+	if want := (TagSet{"go": 1}); !maps.Equal(got.Draft.Tags, want) {
+		t.Fatalf("after removing the malformed tag: %v, want %v", got.Draft.Tags, want)
+	}
 
 	_, err = newTagEngine(storeOnly{newFakeStore()}).UpdateTags(ctx, UpdateTagsInput{Match: match})
 	wantKind(t, err, KindInternal)

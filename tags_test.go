@@ -253,7 +253,9 @@ func TestTagsTravelWithSnapshots(t *testing.T) {
 	}
 }
 
-func TestPublishChecksOnlyTheTagCount(t *testing.T) {
+// TestPublishNeverRevalidatesTags: tags are validated when written, so a narrowed policy
+// (closed values, namespaces or a lowered MaxTags) never blocks publishing existing content.
+func TestPublishNeverRevalidatesTags(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
 	e := newTagEngine(store)
@@ -261,13 +263,8 @@ func TestPublishChecksOnlyTheTagCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	// Tags that the current policy would no longer accept do not block publishing...
-	seedTags(t, store, item.ID, TagSet{"audience:retired": 1, "region:emea": 1})
+	seedTags(t, store, item.ID, TagSet{"audience:retired": 1, "region:emea": 1, "a": 1, "b": 1, "c": 1, "d": 1})
 	if _, err := e.Publish(ctx, ContentItemMatch{ID: item.ID}); err != nil {
 		t.Fatalf("narrowed policies must not block publish: %v", err)
 	}
-	// ...but more tags than MaxTags do.
-	seedTags(t, store, item.ID, TagSet{"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1})
-	_, err = e.Publish(ctx, ContentItemMatch{ID: item.ID})
-	wantKind(t, err, KindNotAcceptable)
 }

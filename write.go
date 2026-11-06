@@ -58,35 +58,52 @@ func (e *Engine) write(ctx context.Context, match ContentItemMatch, failure stri
 	return item, changed, nil
 }
 
-// casWrite applies mutate to item and replaces the stored document only if its draft
-// revision is still the loaded one, reloading and retrying otherwise.
-func (e *Engine) casWrite(ctx context.Context, match ContentItemMatch, item *ContentItem, failure string, mutate mutation) (*ContentItem, bool, error) {
-	for attempt := 1; ; attempt++ {
+// casWrite applies mutate to the loaded item and replaces the stored document only if its
+// draft revision is still the loaded one, reloading and retrying otherwise.
+func (e *Engine) casWrite(ctx context.Context, match ContentItemMatch, loaded *ContentItem, failure string, mutate mutation) (*ContentItem, bool, error) {
+	var changed bool
+	item, err := retryConflicts(func() (*ContentItem, bool, error) {
+		item := loaded
+		loaded = nil // later attempts reload
+		if item == nil {
+			var err error
+			if item, err = e.loadByMatch(ctx, match); err != nil {
+				return nil, false, err
+			}
+		}
 		var expected *int64
 		if item.Draft != nil {
 			expected = new(item.Draft.Revision)
 		}
-		changed, err := mutate(ctx, item)
-		if err != nil {
-			return nil, false, err
+		var err error
+		if changed, err = mutate(ctx, item); err != nil || !changed {
+			return item, false, err
 		}
-		if !changed {
-			return item, false, nil
-		}
-		err = e.store.Upsert(ctx, item, expected)
-		if err == nil {
-			return item, true, nil
-		}
-		if !errors.Is(err, ErrConflict) {
+		if err := e.store.Upsert(ctx, item, expected); err != nil {
+			if errors.Is(err, ErrConflict) {
+				return nil, true, nil
+			}
 			return nil, false, internalErr(err, failure)
 		}
-		if attempt == maxWriteAttempts {
-			return nil, false, conflict("item keeps changing concurrently: retry later")
-		}
-		if item, err = e.loadByMatch(ctx, match); err != nil {
-			return nil, false, err
+		return item, false, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return item, changed, nil
+}
+
+// retryConflicts runs attempt until it does not report a lost compare-and-swap, at most
+// maxWriteAttempts times; each attempt reloads what it writes.
+func retryConflicts[T any](attempt func() (result T, conflicted bool, err error)) (T, error) {
+	for range maxWriteAttempts {
+		result, conflicted, err := attempt()
+		if err != nil || !conflicted {
+			return result, err
 		}
 	}
+	var zero T
+	return zero, conflict("item keeps changing concurrently: retry later")
 }
 
 // tagged reports whether item's whole-document writes must compare-and-swap: its type

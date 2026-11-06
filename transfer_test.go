@@ -2,6 +2,7 @@ package contentstore
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -162,6 +163,30 @@ func TestReplaceContentValidatesTree(t *testing.T) {
 			} else if err != nil {
 				t.Fatalf("ReplaceContent: %v", err)
 			}
+		})
+	}
+}
+
+func TestReplaceContentValidatesTags(t *testing.T) {
+	t.Parallel()
+	for name, tags := range map[string]TagSet{
+		"empty tag ID":      {"": 1},
+		"malformed tag":     {"topic: x ": 1},
+		"non-finite weight": {"go": math.Inf(1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			item := transferTestItem("tagged", "", time.Now().UTC())
+			item.Draft.Tags = tags
+			export := ContentExport{FormatVersion: ContentExportFormatVersion, ItemCount: 1, Items: []*ContentItem{item}}
+			if name != "non-finite weight" { // JSON cannot checksum an infinite weight
+				var err error
+				if export.Checksum, err = contentItemsChecksum(export.Items); err != nil {
+					t.Fatalf("checksum: %v", err)
+				}
+			}
+			_, err := New(Deps{Store: newFakeStore(), Role: DeploymentRoleSandbox}).ReplaceContent(context.Background(), export)
+			wantKind(t, err, KindBadRequest)
 		})
 	}
 }

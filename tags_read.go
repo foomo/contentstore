@@ -92,8 +92,9 @@ func (e *Engine) ListTagged(ctx context.Context, view SnapshotView, input ListTa
 	var lastReturned *TagCursor
 	budget := rankingScanFactor * limit
 	for {
-		// One row more than the page still needs tells whether another page exists.
-		want := limit - len(page.Items) + 1
+		// Fetch a page-sized batch (within the scan budget); its extra row tells whether
+		// another page exists.
+		want := min(limit, budget) + 1
 		rows, err := e.tags.FindTagged(ctx, TagQuery{Tag: input.Tag, View: view, Types: input.Types, After: after, Fields: fields, Limit: want})
 		if err != nil {
 			return nil, internalErr(err, "list tagged failed")
