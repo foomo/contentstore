@@ -33,6 +33,7 @@ type ContentStore interface {
 type Engine struct {
 	store   Store
 	tree    TreeStore // the store's tree capabilities; nil when it has none
+	tags    TagStore  // the store's tag capabilities; nil when it has none
 	schemas *Registry
 	locales LocaleConfig
 	newID   func() string
@@ -49,9 +50,11 @@ func New(d Deps) *Engine {
 		role = DeploymentRoleCanonical
 	}
 	tree, _ := d.Store.(TreeStore)
+	tags, _ := d.Store.(TagStore)
 	return &Engine{
 		store:   d.Store,
 		tree:    tree,
+		tags:    tags,
 		schemas: d.Schemas,
 		locales: d.Locales,
 		newID:   d.NewID,
@@ -76,23 +79,49 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 		return e.saveTreeDraft(ctx, input)
 	}
 
-	item, _, err := e.resolveForSave(ctx, input)
+	item, created, err := e.resolveForSave(ctx, input)
 	if err != nil {
 		return nil, err
 	}
 	if e.onTree(item) {
 		return e.saveTreeDraft(ctx, input)
 	}
-	if err := e.saveDraft(ctx, item, input); err != nil {
+	if !created && input.ExpectedRevision == nil && e.tagged(item) {
+		return e.saveTaggedDraft(ctx, input, item)
+	}
+	if err := e.saveDraft(ctx, item, input, input.ExpectedRevision); err != nil {
 		return nil, err
 	}
 	e.emit(item, OpSaveDraft)
 	return item, nil
 }
 
+// saveTaggedDraft is SaveDraft for an existing item that takes tags: the draft is replaced
+// only if its revision is still the loaded one, retrying from a fresh load otherwise, so
+// a concurrent targeted write (UpdateTags, SetFieldValue) is never overwritten.
+func (e *Engine) saveTaggedDraft(ctx context.Context, input SaveDraftInput, item *ContentItem) (*ContentItem, error) {
+	for attempt := 1; ; attempt++ {
+		var expected *int64
+		if item.Draft != nil {
+			expected = new(item.Draft.Revision)
+		}
+		err := e.saveDraft(ctx, item, input, expected)
+		if err == nil {
+			e.emit(item, OpSaveDraft)
+			return item, nil
+		}
+		if typed, ok := errors.AsType[*Error](err); !ok || typed.Kind != KindConflict || attempt == maxWriteAttempts {
+			return nil, err
+		}
+		if item, _, err = e.resolveForSave(ctx, input); err != nil {
+			return nil, err
+		}
+	}
+}
+
 // saveDraft validates input.Fields against the item's type and writes them as the item's
-// new draft snapshot.
-func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDraftInput) error {
+// new draft snapshot, expecting the given stored draft revision (nil: unconditionally).
+func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDraftInput, expected *int64) error {
 	if err := e.validateDraft(item.Type, input.Fields); err != nil {
 		return err
 	}
@@ -127,7 +156,7 @@ func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDra
 	}
 	item.UpdatedAt = now
 
-	if err := e.store.Upsert(ctx, item, input.ExpectedRevision); err != nil {
+	if err := e.store.Upsert(ctx, item, expected); err != nil {
 		if errors.Is(err, ErrConflict) {
 			return conflict("draft revision conflict")
 		}
@@ -231,7 +260,7 @@ func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (
 
 // Publish copies the current draft snapshot into the published snapshot.
 func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.write(ctx, match, e.publish)
+	item, _, err := e.write(ctx, match, "publish failed", e.publish)
 	if err != nil {
 		return nil, err
 	}
@@ -239,24 +268,24 @@ func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentI
 	return item, nil
 }
 
-func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
+func (e *Engine) publish(_ context.Context, item *ContentItem) (bool, error) {
 	if err := rejectArchived(item); err != nil {
-		return err
+		return false, err
 	}
 	if item.Draft == nil {
-		return notAcceptable("nothing to publish: item has no draft")
+		return false, notAcceptable("nothing to publish: item has no draft")
 	}
 	if err := e.validatePublish(item.Type, item.Draft.Fields); err != nil {
-		return err
+		return false, err
 	}
 	if err := e.validatePublishTags(item.Type, item.Draft.Tags); err != nil {
-		return err
+		return false, err
 	}
 	// Concurrent SetFieldValue calls are checked against the draft each one read, so
 	// together they can outgrow the guard; publishing would then exceed the document size.
 	if e.guardsDraftSize(item.Type) {
 		if err := validateDraftSize(item.Draft.Fields); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -271,11 +300,7 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 	}
 	item.Published = &published
 	item.UpdatedAt = now
-
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return internalErr(err, "publish failed")
-	}
-	return nil
+	return true, nil
 }
 
 // Unpublish drops the published snapshot, returning the item to Draft while keeping the
@@ -284,11 +309,7 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 // left alone (and emits nothing) rather than rejected, so bulk callers can apply it to a
 // mixed selection. Unpublishing a tree container hides its subtree from the published view.
 func (e *Engine) Unpublish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	var changed bool
-	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) (err error) {
-		changed, err = e.unpublish(ctx, item)
-		return err
-	})
+	item, changed, err := e.write(ctx, match, "unpublish failed", e.unpublish)
 	if err != nil {
 		return nil, err
 	}
@@ -298,8 +319,10 @@ func (e *Engine) Unpublish(ctx context.Context, match ContentItemMatch) (*Conten
 	return item, nil
 }
 
-// unpublish drops the item's published snapshot, reporting whether there was one.
-func (e *Engine) unpublish(ctx context.Context, item *ContentItem) (bool, error) {
+// unpublish drops the item's published snapshot, reporting whether there was one. The
+// write replaces the whole document: a partial $set could not clear the omitempty
+// published field (see Unarchive and archive_integration_test.go).
+func (e *Engine) unpublish(_ context.Context, item *ContentItem) (bool, error) {
 	if err := rejectArchived(item); err != nil {
 		return false, err
 	}
@@ -308,11 +331,6 @@ func (e *Engine) unpublish(ctx context.Context, item *ContentItem) (bool, error)
 	}
 	item.Published = nil
 	item.UpdatedAt = time.Now().UTC()
-	// Upsert replaces the whole document; a partial $set could not clear the omitempty
-	// published field (see Unarchive and archive_integration_test.go).
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return false, internalErr(err, "unpublish failed")
-	}
 	return true, nil
 }
 
@@ -330,13 +348,16 @@ func rejectArchived(item *ContentItem) error {
 // Archive hides an item while keeping both snapshots. A tree item can only be archived
 // once all its children are.
 func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) error {
+	item, _, err := e.write(ctx, match, "archive failed", func(ctx context.Context, item *ContentItem) (bool, error) {
 		if e.onTree(item) {
 			if err := e.rejectChildren(ctx, item, ChildrenLive, "archive its children first"); err != nil {
-				return err
+				return false, err
 			}
 		}
-		return e.archive(ctx, item)
+		now := time.Now().UTC()
+		item.ArchivedAt = &now
+		item.UpdatedAt = now
+		return true, nil
 	})
 	if err != nil {
 		return nil, err
@@ -345,45 +366,28 @@ func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentI
 	return item, nil
 }
 
-func (e *Engine) archive(ctx context.Context, item *ContentItem) error {
-	now := time.Now().UTC()
-	item.ArchivedAt = &now
-	item.UpdatedAt = now
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return internalErr(err, "archive failed")
-	}
-	return nil
-}
-
 // Unarchive restores an archived item to Draft. It drops the published snapshot: a
 // previously-published item is NOT re-published automatically (symmetric to Contentful,
 // where archived entries are never published). The working draft is preserved, so no
 // content is lost; re-publish to make it live again. A tree item can only be unarchived
 // while its parent is not archived.
 func (e *Engine) Unarchive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.write(ctx, match, func(ctx context.Context, item *ContentItem) error {
+	item, _, err := e.write(ctx, match, "unarchive failed", func(ctx context.Context, item *ContentItem) (bool, error) {
 		if e.onTree(item) {
 			if err := e.rejectArchivedParent(ctx, item); err != nil {
-				return err
+				return false, err
 			}
 		}
-		return e.unarchive(ctx, item)
+		item.ArchivedAt = nil
+		item.Published = nil
+		item.UpdatedAt = time.Now().UTC()
+		return true, nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	e.emit(item, OpUnarchive)
 	return item, nil
-}
-
-func (e *Engine) unarchive(ctx context.Context, item *ContentItem) error {
-	item.ArchivedAt = nil
-	item.Published = nil
-	item.UpdatedAt = time.Now().UTC()
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return internalErr(err, "unarchive failed")
-	}
-	return nil
 }
 
 // Delete hard-deletes an item. Deleting a missing item is idempotent (returns false). A

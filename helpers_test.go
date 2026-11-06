@@ -83,6 +83,16 @@ type fakeStore struct {
 
 	treeMu           sync.Mutex
 	treeTransactions int
+
+	// beforeWrite, when set, runs before Upsert and UpdateTags apply, to inject a
+	// concurrent write between an engine's load and its write.
+	beforeWrite func()
+}
+
+func (f *fakeStore) runBeforeWrite() {
+	if hook := f.beforeWrite; hook != nil {
+		hook()
+	}
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{items: map[string]*ContentItem{}} }
@@ -108,6 +118,7 @@ func (f *fakeStore) GetByKey(_ context.Context, key string) (*ContentItem, error
 }
 
 func (f *fakeStore) Upsert(_ context.Context, item *ContentItem, expectedDraftRevision *int64) error {
+	f.runBeforeWrite()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.nameTaken(item) {
@@ -316,6 +327,29 @@ func (f *fakeStore) ReplaceAll(_ context.Context, items []*ContentItem) error {
 	}
 	f.items = replacement
 	return nil
+}
+
+// UpdateTags mirrors Persistor.UpdateTags: a compare-and-swap on the draft revision.
+func (f *fakeStore) UpdateTags(_ context.Context, u TagUpdate) (*ContentItem, error) {
+	f.runBeforeWrite()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item := f.items[u.ID]
+	if item == nil || item.ArchivedAt != nil || item.Draft == nil || item.Draft.Revision != u.ExpectedRevision {
+		return nil, ErrConflict
+	}
+	var tags TagSet
+	if len(u.Tags) > 0 {
+		tags = maps.Clone(u.Tags)
+	}
+	draft := *item.Draft
+	draft.Tags = tags
+	draft.Revision++
+	draft.SchemaVersion, draft.SchemaHash = u.SchemaVersion, u.SchemaHash
+	draft.UpdatedAt = u.Now
+	item.Draft = &draft
+	item.UpdatedAt = u.Now
+	return cloneContentItem(item), nil
 }
 
 // RunTreeTransaction serializes tree transactions like the persistor's lock document. It

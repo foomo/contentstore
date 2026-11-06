@@ -224,6 +224,16 @@ type ArchivedContentItem struct {
 	UpdatedAt  time.Time     `json:"updatedAt"`
 }
 
+// UpdateTagsInput changes an item's draft tags, the only way to write tags. Set adds tags
+// or changes their weights (a nil weight is 1); Remove drops tags; with Replace, Set
+// becomes the complete set (and Remove must be empty), so an empty Set clears all tags.
+type UpdateTagsInput struct {
+	Match   ContentItemMatch    `json:"match"`
+	Set     map[string]*float64 `json:"set,omitempty"`
+	Remove  []string            `json:"remove,omitempty"`
+	Replace bool                `json:"replace,omitempty"`
+}
+
 // ListChildrenInput lists the children of ParentID (named root-level items when empty),
 // ordered by name. Types narrows them by content type and Fields projects their field
 // sets (all fields when empty). Limit defaults to 100 and may be at most 1000; Cursor

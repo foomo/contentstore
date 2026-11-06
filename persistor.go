@@ -35,7 +35,10 @@ type Persistor struct {
 	treeLockReady bool
 }
 
-var _ TreeStore = (*Persistor)(nil)
+var (
+	_ TreeStore = (*Persistor)(nil)
+	_ TagStore  = (*Persistor)(nil)
+)
 
 // NewMongoStore connects to MongoDB (database taken from the connection string) and
 // ensures the content_items indexes, returning a ready Store.
@@ -556,4 +559,40 @@ func childProjection(fields []FieldID) bson.D {
 		}
 	}
 	return projection
+}
+
+// UpdateTags replaces the draft tag set when the item is not archived and its draft
+// revision is still u.ExpectedRevision, bumping the revision; ErrConflict otherwise. The
+// tag document is built with escaped keys here rather than through the TagSet codec.
+func (p *Persistor) UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, error) {
+	filter := bson.D{
+		{Key: "_id", Value: u.ID},
+		{Key: "archivedAt", Value: nil},
+		{Key: "draft.revision", Value: u.ExpectedRevision},
+	}
+	set := bson.D{
+		{Key: "updatedAt", Value: u.Now},
+		{Key: "draft.updatedAt", Value: u.Now},
+		{Key: "draft.schemaVersion", Value: u.SchemaVersion},
+		{Key: "draft.schemaHash", Value: u.SchemaHash},
+	}
+	update := bson.D{}
+	if len(u.Tags) == 0 {
+		update = append(update, bson.E{Key: "$unset", Value: bson.D{{Key: "draft.tags", Value: ""}}})
+	} else {
+		set = append(set, bson.E{Key: "draft.tags", Value: tagsDocument(u.Tags)})
+	}
+	update = append(update,
+		bson.E{Key: "$set", Value: set},
+		bson.E{Key: "$inc", Value: bson.D{{Key: "draft.revision", Value: int64(1)}}},
+	)
+	item := &ContentItem{}
+	err := p.coll.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(item)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: update tags: %w", err)
+	}
+	return item, nil
 }

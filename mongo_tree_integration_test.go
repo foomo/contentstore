@@ -33,7 +33,7 @@ func newMongoTreeEngine(t *testing.T) (*Engine, *Persistor) {
 	}
 	var n atomic.Int64
 	newID := func() string { return fmt.Sprintf("id-%d", n.Add(1)) }
-	return New(Deps{Store: store, Schemas: treeRegistry(), Locales: testLocales, NewID: newID}), store
+	return New(Deps{Store: store, Schemas: tagRegistry(), Locales: testLocales, NewID: newID}), store
 }
 
 func TestTreeWritesInMongo(t *testing.T) {

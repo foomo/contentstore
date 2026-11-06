@@ -199,6 +199,11 @@ func (r *recordingStore) FindChildren(ctx context.Context, q ChildQuery) ([]*Con
 	return r.inner.FindChildren(ctx, q)
 }
 
+func (r *recordingStore) UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, error) {
+	r.record("UpdateTags(%s,expected=%d)", u.ID, u.ExpectedRevision)
+	return r.inner.UpdateTags(ctx, u)
+}
+
 // compatStep is one ContentStore operation of the legacy-type scenario.
 type compatStep struct {
 	name string
@@ -458,6 +463,7 @@ func TestCompatStoreCallSequence(t *testing.T) {
 	ctx := context.Background()
 	rec := &recordingStore{inner: newFakeStore()}
 	var _ TreeStore = rec
+	var _ TagStore = rec
 	// Tree and tagged types are registered next to the legacy type, as a knowledge base would.
 	e := New(Deps{Store: rec, Schemas: tagRegistry(), Locales: testLocales, NewID: testNewID()})
 	var got []string

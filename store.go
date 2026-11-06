@@ -88,3 +88,25 @@ type ChildQuery struct {
 	// Limit caps the number of children (unlimited when zero).
 	Limit int
 }
+
+// TagStore is the optional persistence contract for tag writes. *Persistor implements it;
+// an Engine over a Store without it rejects UpdateTags, so existing Store implementations
+// keep working unchanged.
+type TagStore interface {
+	Store
+	// UpdateTags replaces the draft tag set of item u.ID and bumps its draft revision, if
+	// the item is not archived and its stored draft revision is u.ExpectedRevision. It
+	// returns ErrConflict otherwise, including when the item no longer exists.
+	UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, error)
+}
+
+// TagUpdate is a compare-and-swap write of an item's complete draft tag set.
+type TagUpdate struct {
+	ID               string
+	ExpectedRevision int64
+	// Tags is the complete new set; empty clears the tags.
+	Tags          TagSet
+	SchemaVersion string
+	SchemaHash    string
+	Now           time.Time
+}
