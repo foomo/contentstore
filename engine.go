@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 )
 
@@ -106,15 +107,18 @@ func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDra
 
 	revision := int64(1)
 	createdAt := now
+	var tags TagSet // SaveDraft replaces the fields; tags only change through UpdateTags
 	if item.Draft != nil {
 		revision = item.Draft.Revision + 1
 		createdAt = item.Draft.CreatedAt
+		tags = item.Draft.Tags
 	}
 	item.Draft = &ContentSnapshot{
 		Revision:      revision,
 		SchemaVersion: schema.Version,
 		SchemaHash:    schema.Hash,
 		Fields:        input.Fields,
+		Tags:          tags,
 		CreatedAt:     createdAt,
 		UpdatedAt:     now,
 	}
@@ -245,6 +249,9 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 	if err := e.validatePublish(item.Type, item.Draft.Fields); err != nil {
 		return err
 	}
+	if err := e.validatePublishTags(item.Type, item.Draft.Tags); err != nil {
+		return err
+	}
 	// Concurrent SetFieldValue calls are checked against the draft each one read, so
 	// together they can outgrow the guard; publishing would then exceed the document size.
 	if e.guardsDraftSize(item.Type) {
@@ -255,6 +262,7 @@ func (e *Engine) publish(ctx context.Context, item *ContentItem) error {
 
 	now := time.Now().UTC()
 	published := *item.Draft // published revision equals the draft revision → Published state
+	published.Tags = maps.Clone(item.Draft.Tags)
 	published.UpdatedAt = now
 	if item.Published != nil {
 		published.CreatedAt = item.Published.CreatedAt
@@ -477,6 +485,7 @@ func toSnapshotItem(view SnapshotView, item *ContentItem) (SnapshotItem, bool) {
 			return SnapshotItem{}, false
 		}
 		out.Fields = item.Published.Fields
+		out.Tags = item.Published.Tags
 		out.State = StatePublished
 		out.UpdatedAt = item.Published.UpdatedAt
 	case SnapshotViewPreview:
@@ -484,6 +493,7 @@ func toSnapshotItem(view SnapshotView, item *ContentItem) (SnapshotItem, bool) {
 			return SnapshotItem{}, false
 		}
 		out.Fields = item.Draft.Fields
+		out.Tags = item.Draft.Tags
 		out.State = item.State()
 		out.UpdatedAt = item.UpdatedAt
 	default:
@@ -514,6 +524,7 @@ func (e *Engine) GetArchivedSnapshot(ctx context.Context, input ArchivedSnapshot
 			ParentID:   item.ParentID,
 			Name:       item.Name,
 			Fields:     item.Draft.Fields,
+			Tags:       item.Draft.Tags,
 			ArchivedAt: *item.ArchivedAt,
 			UpdatedAt:  item.UpdatedAt,
 		})

@@ -59,6 +59,7 @@ type ContentSnapshot struct {
 	SchemaVersion string        `json:"schemaVersion" bson:"schemaVersion"`
 	SchemaHash    string        `json:"schemaHash" bson:"schemaHash"`
 	Fields        ContentFields `json:"fields" bson:"fields"`
+	Tags          TagSet        `json:"tags,omitempty" bson:"tags,omitempty"`
 	CreatedAt     time.Time     `json:"createdAt" bson:"createdAt"`
 	UpdatedAt     time.Time     `json:"updatedAt" bson:"updatedAt"`
 }
@@ -188,6 +189,7 @@ type SnapshotItem struct {
 	Name      string        `json:"name,omitempty"`
 	State     string        `json:"state"`
 	Fields    ContentFields `json:"fields"`
+	Tags      TagSet        `json:"tags,omitempty"`
 	UpdatedAt time.Time     `json:"updatedAt"`
 }
 
@@ -217,6 +219,7 @@ type ArchivedContentItem struct {
 	ParentID   string        `json:"parentId,omitempty"`
 	Name       string        `json:"name,omitempty"`
 	Fields     ContentFields `json:"fields"`
+	Tags       TagSet        `json:"tags,omitempty"`
 	ArchivedAt time.Time     `json:"archivedAt"`
 	UpdatedAt  time.Time     `json:"updatedAt"`
 }

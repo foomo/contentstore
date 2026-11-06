@@ -193,12 +193,17 @@ func (f *fakeStore) SetField(_ context.Context, in FieldUpdate) (*ContentItem, e
 		createdAt = item.Draft.CreatedAt
 		base = item.Draft.Fields
 	}
+	var tags TagSet // the persistor's targeted $set leaves draft.tags alone
+	if item.Draft != nil {
+		tags = item.Draft.Tags
+	}
 	item.Type = in.Type
 	item.Draft = &ContentSnapshot{
 		Revision:      revision,
 		SchemaVersion: in.SchemaVersion,
 		SchemaHash:    in.SchemaHash,
 		Fields:        mergeFieldValue(base, in.FieldID, in.Locale, in.Value),
+		Tags:          tags,
 		CreatedAt:     createdAt,
 		UpdatedAt:     in.Now,
 	}
@@ -378,10 +383,12 @@ func cloneContentItem(item *ContentItem) *ContentItem {
 	clone := *item
 	if item.Draft != nil {
 		draft := *item.Draft
+		draft.Tags = maps.Clone(draft.Tags)
 		clone.Draft = &draft
 	}
 	if item.Published != nil {
 		published := *item.Published
+		published.Tags = maps.Clone(published.Tags)
 		clone.Published = &published
 	}
 	if item.OwnerRef != nil {

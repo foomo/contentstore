@@ -115,6 +115,20 @@ func withFieldValue(fields ContentFields, fieldID, locale string, value FieldVal
 	return out
 }
 
+// validatePublishTags re-checks only the tag count on publish: concurrent tag writes are
+// checked against the set each one read. The rest of the policy is enforced when tags are
+// written, so narrowing a policy never blocks publishing existing content.
+func (e *Engine) validatePublishTags(t ContentType, tags TagSet) error {
+	schema, ok := e.schemas.schemaFor(t)
+	if !ok || schema.Tags == nil {
+		return nil
+	}
+	if limit := schema.Tags.maxTags(); len(tags) > limit {
+		return notAcceptable(fmt.Sprintf("item has %d tags, more than the %d allowed", len(tags), limit))
+	}
+	return nil
+}
+
 // validateValue enforces the field type and size limit for a single locale value. A nil
 // value clears the locale and is always allowed.
 func validateValue(fd FieldDefinition, value FieldValue) error {

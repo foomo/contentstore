@@ -458,8 +458,8 @@ func TestCompatStoreCallSequence(t *testing.T) {
 	ctx := context.Background()
 	rec := &recordingStore{inner: newFakeStore()}
 	var _ TreeStore = rec
-	// Tree types are registered next to the legacy type, as a knowledge base would.
-	e := New(Deps{Store: rec, Schemas: treeRegistry(), Locales: testLocales, NewID: testNewID()})
+	// Tree and tagged types are registered next to the legacy type, as a knowledge base would.
+	e := New(Deps{Store: rec, Schemas: tagRegistry(), Locales: testLocales, NewID: testNewID()})
 	var got []string
 	for _, step := range compatScenario() {
 		rec.calls = nil

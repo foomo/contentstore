@@ -65,6 +65,10 @@ type ContentTypeSchema struct {
 	// a container or listed by one is a tree type; its items carry a Name unique within
 	// their parent. Like SuppressChangeEvents it is a policy and not part of the hash.
 	ChildTypes []ContentType `json:"childTypes,omitempty"`
+
+	// Tags enables tags on items of this type (nil: they cannot be tagged). Like
+	// ChildTypes it is a policy and not part of the hash.
+	Tags *TagPolicy `json:"tags,omitempty"`
 }
 
 // FieldDefinition describes one field. ReadOnly marks system-generated fields editors
@@ -109,6 +113,11 @@ func (r *Registry) Register(s ContentTypeSchema) {
 	for _, f := range s.Fields {
 		if err := f.validateMaxLength(); err != nil {
 			panic(fmt.Sprintf("contentstore: schema %q field %q: %v", s.Type, f.ID, err))
+		}
+	}
+	if s.Tags != nil {
+		if err := s.Tags.validate(); err != nil {
+			panic(fmt.Sprintf("contentstore: schema %q tags: %v", s.Type, err))
 		}
 	}
 	if s.Hash == "" {
