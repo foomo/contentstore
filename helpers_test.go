@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testType is a representative content type used across the core tests. It mirrors
@@ -507,4 +508,147 @@ func seedPublishable(t *testing.T, e *Engine, key, ownerID string) {
 	}); err != nil {
 		t.Fatalf("seed draft: %v", err)
 	}
+}
+
+// fakeScheduleStore adds scheduled actions to the in-memory store. It mirrors the
+// persistor's unique (itemId, at) index on pending actions and its runner lease. It embeds
+// *fakeStore, so the stores of existing tests keep no scheduled actions.
+type fakeScheduleStore struct {
+	*fakeStore
+	smu        sync.Mutex
+	actions    map[string]*ScheduledAction
+	holder     string
+	leaseUntil time.Time
+}
+
+func newFakeScheduleStore() *fakeScheduleStore {
+	return &fakeScheduleStore{fakeStore: newFakeStore(), actions: map[string]*ScheduledAction{}}
+}
+
+func (f *fakeScheduleStore) SchedulesEnabled() bool { return true }
+
+func (f *fakeScheduleStore) pendingTaken(a *ScheduledAction) bool {
+	if a.Status != ActionPending {
+		return false
+	}
+	for _, other := range f.actions {
+		if other.ID != a.ID && other.Status == ActionPending && other.ItemID == a.ItemID && other.At.Equal(a.At) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeScheduleStore) InsertScheduledAction(_ context.Context, a *ScheduledAction) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if _, ok := f.actions[a.ID]; ok || f.pendingTaken(a) {
+		return ErrConflict
+	}
+	clone := *a
+	f.actions[a.ID] = &clone
+	return nil
+}
+
+func (f *fakeScheduleStore) GetScheduledAction(_ context.Context, id string) (*ScheduledAction, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	a, ok := f.actions[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	clone := *a
+	return &clone, nil
+}
+
+func scheduleQueryMatches(q ScheduledActionQuery, a *ScheduledAction) bool {
+	switch {
+	case q.ID != "" && a.ID != q.ID,
+		q.ItemID != "" && a.ItemID != q.ItemID,
+		len(q.Statuses) > 0 && !slices.Contains(q.Statuses, a.Status),
+		q.From != nil && a.At.Before(*q.From),
+		q.To != nil && !a.At.Before(*q.To):
+		return false
+	case q.After != nil:
+		return a.At.After(q.After.At) || a.At.Equal(q.After.At) && a.ID > q.After.ID
+	}
+	return true
+}
+
+func (f *fakeScheduleStore) FindScheduledActions(_ context.Context, q ScheduledActionQuery) ([]*ScheduledAction, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	var out []*ScheduledAction
+	for _, a := range f.actions {
+		if scheduleQueryMatches(q, a) {
+			clone := *a
+			out = append(out, &clone)
+		}
+	}
+	slices.SortFunc(out, func(a, b *ScheduledAction) int {
+		return cmp.Or(a.At.Compare(b.At), strings.Compare(a.ID, b.ID))
+	})
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeScheduleStore) UpdateScheduledAction(_ context.Context, a *ScheduledAction, from ...ScheduledActionStatus) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	stored, ok := f.actions[a.ID]
+	if !ok || !slices.Contains(from, stored.Status) {
+		return ErrConflict
+	}
+	if f.pendingTaken(a) {
+		return errors.New("fake schedule store: duplicate pending (itemId, at)")
+	}
+	clone := *a
+	f.actions[a.ID] = &clone
+	return nil
+}
+
+func (f *fakeScheduleStore) DeleteScheduledActions(_ context.Context, q ScheduledActionQuery) (int64, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	q = ScheduledActionQuery{ID: q.ID, ItemID: q.ItemID, Statuses: q.Statuses}
+	var n int64
+	for id, a := range f.actions {
+		if scheduleQueryMatches(q, a) {
+			delete(f.actions, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeScheduleStore) AcquireScheduleRunner(_ context.Context, holder string, until time.Time) (bool, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if f.holder != "" && f.holder != holder && !f.leaseUntil.Before(time.Now()) {
+		return false, nil
+	}
+	f.holder, f.leaseUntil = holder, until
+	return true, nil
+}
+
+func (f *fakeScheduleStore) ReleaseScheduleRunner(_ context.Context, holder string) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if f.holder == holder {
+		f.holder, f.leaseUntil = "", time.Time{}
+	}
+	return nil
+}
+
+// action returns the stored scheduled action with the given ID, failing the test when it
+// does not exist.
+func (f *fakeScheduleStore) action(t *testing.T, id string) ScheduledAction {
+	t.Helper()
+	a, err := f.GetScheduledAction(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get scheduled action %q: %v", id, err)
+	}
+	return *a
 }

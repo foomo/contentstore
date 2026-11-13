@@ -39,6 +39,10 @@ type Engine struct {
 	newID   func() string
 	notify  Notifier
 	role    DeploymentRole
+
+	// schedules is the store's scheduled-action capabilities; nil when it has none or they
+	// are disabled.
+	schedules ScheduleStore
 }
 
 var _ ContentStore = (*Engine)(nil)
@@ -51,7 +55,7 @@ func New(d Deps) *Engine {
 	}
 	tree, _ := d.Store.(TreeStore)
 	tags, _ := d.Store.(TagStore)
-	return &Engine{
+	engine := &Engine{
 		store:   d.Store,
 		tree:    tree,
 		tags:    tags,
@@ -61,6 +65,10 @@ func New(d Deps) *Engine {
 		notify:  d.Notify,
 		role:    role,
 	}
+	if schedules, ok := d.Store.(ScheduleStore); ok && schedules.SchedulesEnabled() {
+		engine.schedules = schedules
+	}
+	return engine
 }
 
 // SaveDraft creates or updates an item's draft snapshot. It does not publish. Items of a
@@ -394,8 +402,9 @@ func (e *Engine) Unarchive(ctx context.Context, match ContentItemMatch) (*Conten
 	return item, nil
 }
 
-// Delete hard-deletes an item. Deleting a missing item is idempotent (returns false). A
-// tree item can only be deleted once it has no children, archived ones included.
+// Delete hard-deletes an item and its scheduled actions. Deleting a missing item is
+// idempotent (returns false). A tree item can only be deleted once it has no children,
+// archived ones included.
 func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, error) {
 	if match.ID == "" && match.Key == "" {
 		return false, badRequest("delete requires a non-empty match (id or key)")
@@ -408,11 +417,16 @@ func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, erro
 		return false, nil
 	}
 	if e.onTree(item) {
-		return e.deleteTreeItem(ctx, match)
+		deleted, err := e.deleteTreeItem(ctx, match)
+		if deleted {
+			e.dropScheduledActions(ctx, item.ID)
+		}
+		return deleted, err
 	}
 	if err := e.store.Delete(ctx, item.ID); err != nil {
 		return false, internalErr(err, "delete failed")
 	}
+	e.dropScheduledActions(ctx, item.ID)
 	e.emit(item, OpDelete)
 	return true, nil
 }

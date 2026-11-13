@@ -29,6 +29,18 @@ const (
 	treeLockID         = "tree"
 )
 
+// Collections of scheduled actions (see WithSchedules). The runner collection holds the
+// single lease document of the scheduled-action runner.
+const (
+	collectionScheduledActions = "content_scheduled_actions"
+	collectionScheduleRunner   = "content_schedule_runner"
+	scheduleRunnerID           = "runner"
+)
+
+// errSchedulesDisabled is returned by the scheduled-action methods of a Persistor built
+// without WithSchedules.
+var errSchedulesDisabled = errors.New("contentstore: scheduled actions are not enabled (see WithSchedules)")
+
 // Index names of the tag rankings (see WithTagIndexes).
 const (
 	indexDraftTagsRank     = "draft_tags_rank"
@@ -46,11 +58,19 @@ func WithTagIndexes() StoreOption {
 	return func(p *Persistor) { p.tagIndexes = true }
 }
 
+// WithSchedules enables scheduled actions (see ContentSchedules): NewMongoStore creates
+// their collection and indexes, and the first run creates the runner's lease collection.
+// Without it the store creates neither and an Engine over it rejects scheduled actions.
+func WithSchedules() StoreOption {
+	return func(p *Persistor) { p.schedules = true }
+}
+
 // Persistor is the MongoDB-backed Store. It depends only on the mongo driver.
 type Persistor struct {
 	client     *mongo.Client
 	coll       *mongo.Collection
 	tagIndexes bool
+	schedules  bool
 	// tagHintMissing records that a ranking index was missing, so later rankings skip the
 	// hint instead of failing it first.
 	tagHintMissing atomic.Bool
@@ -60,8 +80,9 @@ type Persistor struct {
 }
 
 var (
-	_ TreeStore = (*Persistor)(nil)
-	_ TagStore  = (*Persistor)(nil)
+	_ TreeStore     = (*Persistor)(nil)
+	_ TagStore      = (*Persistor)(nil)
+	_ ScheduleStore = (*Persistor)(nil)
 )
 
 // NewMongoStore connects to MongoDB (database taken from the connection string) and
@@ -78,6 +99,12 @@ func NewMongoStore(ctx context.Context, mongoURL string, opts ...StoreOption) (*
 	if err := p.ensureIndexes(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, err
+	}
+	if p.schedules {
+		if err := p.ensureScheduleIndexes(ctx); err != nil {
+			_ = client.Disconnect(context.Background())
+			return nil, err
+		}
 	}
 	return p, nil
 }
@@ -749,4 +776,208 @@ func tagRankIndex(view SnapshotView) string {
 // isMissingHintIndex reports MongoDB's error for a hint naming no existing index.
 func isMissingHintIndex(err error) bool {
 	return strings.Contains(err.Error(), "hint provided does not correspond to an existing index")
+}
+
+// SchedulesEnabled reports whether the Persistor was built with WithSchedules.
+func (p *Persistor) SchedulesEnabled() bool { return p.schedules }
+
+// scheduledActions returns the scheduled-action collection, or errSchedulesDisabled.
+func (p *Persistor) scheduledActions() (*mongo.Collection, error) {
+	if !p.schedules {
+		return nil, errSchedulesDisabled
+	}
+	return p.coll.Database().Collection(collectionScheduledActions), nil
+}
+
+// ensureScheduleIndexes creates the scheduled-action indexes. The partial unique index
+// allows one pending action per item and minute, which makes ScheduleAction's conflict
+// check atomic without a transaction. It covers pending actions only: a new action is
+// always in the future, and one that is running or done is due, so they cannot collide.
+func (p *Persistor) ensureScheduleIndexes(ctx context.Context) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	_, err = coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys: bson.D{{Key: "itemId", Value: 1}, {Key: "at", Value: 1}},
+			Options: options.Index().SetName("item_at_pending_unique").SetUnique(true).
+				SetPartialFilterExpression(bson.D{{Key: "status", Value: string(ActionPending)}}),
+		},
+		// Due actions, and lists by status and time.
+		{
+			Keys:    bson.D{{Key: "status", Value: 1}, {Key: "at", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("status_at"),
+		},
+		// An item's actions, and their removal when it is deleted.
+		{
+			Keys:    bson.D{{Key: "itemId", Value: 1}, {Key: "at", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("itemId_at"),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure schedule indexes: %w", err)
+	}
+	return nil
+}
+
+// InsertScheduledAction stores a new action; ErrConflict when the item already has a
+// pending action at the same time.
+func (p *Persistor) InsertScheduledAction(ctx context.Context, action *ScheduledAction) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	if _, err := coll.InsertOne(ctx, action); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("contentstore: insert scheduled action: %w", err)
+	}
+	return nil
+}
+
+// GetScheduledAction returns the action with the given ID, or ErrNotFound.
+func (p *Persistor) GetScheduledAction(ctx context.Context, id string) (*ScheduledAction, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return nil, err
+	}
+	action := &ScheduledAction{}
+	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(action); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("contentstore: get scheduled action: %w", err)
+	}
+	return action, nil
+}
+
+// FindScheduledActions returns the actions matching q, ordered by At, then ID.
+func (p *Persistor) FindScheduledActions(ctx context.Context, q ScheduledActionQuery) ([]*ScheduledAction, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return nil, err
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "at", Value: 1}, {Key: "_id", Value: 1}})
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	cur, err := coll.Find(ctx, scheduleFilter(q), opts)
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find scheduled actions: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var actions []*ScheduledAction
+	if err := cur.All(ctx, &actions); err != nil {
+		return nil, fmt.Errorf("contentstore: find scheduled actions decode: %w", err)
+	}
+	return actions, nil
+}
+
+// UpdateScheduledAction replaces the stored action if its status is one of from;
+// ErrConflict otherwise.
+func (p *Persistor) UpdateScheduledAction(ctx context.Context, action *ScheduledAction, from ...ScheduledActionStatus) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{
+		{Key: "_id", Value: action.ID},
+		{Key: "status", Value: bson.D{{Key: "$in", Value: from}}},
+	}
+	result, err := coll.ReplaceOne(ctx, filter, action)
+	if err != nil {
+		return fmt.Errorf("contentstore: update scheduled action: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// DeleteScheduledActions deletes the actions matching q's ID, ItemID and Statuses; an
+// empty query deletes every action.
+func (p *Persistor) DeleteScheduledActions(ctx context.Context, q ScheduledActionQuery) (int64, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return 0, err
+	}
+	filter := scheduleFilter(ScheduledActionQuery{ID: q.ID, ItemID: q.ItemID, Statuses: q.Statuses})
+	result, err := coll.DeleteMany(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("contentstore: delete scheduled actions: %w", err)
+	}
+	return result.DeletedCount, nil
+}
+
+// scheduleFilter translates a scheduled-action query into a filter.
+func scheduleFilter(q ScheduledActionQuery) bson.D {
+	filter := bson.D{}
+	if q.ID != "" {
+		filter = append(filter, bson.E{Key: "_id", Value: q.ID})
+	}
+	if q.ItemID != "" {
+		filter = append(filter, bson.E{Key: "itemId", Value: q.ItemID})
+	}
+	if len(q.Statuses) > 0 {
+		filter = append(filter, bson.E{Key: "status", Value: bson.D{{Key: "$in", Value: q.Statuses}}})
+	}
+	at := bson.D{}
+	if q.From != nil {
+		at = append(at, bson.E{Key: "$gte", Value: *q.From})
+	}
+	if q.To != nil {
+		at = append(at, bson.E{Key: "$lt", Value: *q.To})
+	}
+	if len(at) > 0 {
+		filter = append(filter, bson.E{Key: "at", Value: at})
+	}
+	if q.After != nil {
+		filter = append(filter, bson.E{Key: "$or", Value: bson.A{
+			bson.D{{Key: "at", Value: bson.D{{Key: "$gt", Value: q.After.At}}}},
+			bson.D{{Key: "at", Value: q.After.At}, {Key: "_id", Value: bson.D{{Key: "$gt", Value: q.After.ID}}}},
+		}})
+	}
+	return filter
+}
+
+// AcquireScheduleRunner takes or extends the runner lease with one upsert of the lease
+// document: it matches when holder already has the lease or the lease has expired, and
+// otherwise tries to insert a second document with the same _id, which fails on the
+// duplicate key while another holder's lease is valid.
+func (p *Persistor) AcquireScheduleRunner(ctx context.Context, holder string, until time.Time) (bool, error) {
+	if !p.schedules {
+		return false, errSchedulesDisabled
+	}
+	coll := p.coll.Database().Collection(collectionScheduleRunner)
+	filter := bson.D{
+		{Key: "_id", Value: scheduleRunnerID},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "holder", Value: holder}},
+			bson.D{{Key: "leaseUntil", Value: bson.D{{Key: "$lt", Value: time.Now().UTC()}}}},
+		}},
+	}
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "holder", Value: holder}, {Key: "leaseUntil", Value: until}}}}
+	_, err := coll.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
+	if mongo.IsDuplicateKeyError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("contentstore: acquire schedule runner: %w", err)
+	}
+	return true, nil
+}
+
+// ReleaseScheduleRunner removes the lease document if holder has the lease.
+func (p *Persistor) ReleaseScheduleRunner(ctx context.Context, holder string) error {
+	if !p.schedules {
+		return errSchedulesDisabled
+	}
+	coll := p.coll.Database().Collection(collectionScheduleRunner)
+	if _, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: scheduleRunnerID}, {Key: "holder", Value: holder}}); err != nil {
+		return fmt.Errorf("contentstore: release schedule runner: %w", err)
+	}
+	return nil
 }

@@ -324,3 +324,76 @@ type TreeRef struct {
 type SchemasResult struct {
 	Schemas []ContentTypeSchema `json:"schemas"`
 }
+
+// ScheduledActionType is what a scheduled action does to its item when it runs.
+type ScheduledActionType string
+
+const (
+	ActionPublish   ScheduledActionType = "publish"
+	ActionUnpublish ScheduledActionType = "unpublish"
+	ActionArchive   ScheduledActionType = "archive"
+)
+
+// ScheduledActionStatus is the lifecycle of a scheduled action: pending until a runner
+// claims it, running while it executes, then succeeded or failed.
+type ScheduledActionStatus string
+
+const (
+	ActionPending   ScheduledActionStatus = "pending"
+	ActionRunning   ScheduledActionStatus = "running"
+	ActionSucceeded ScheduledActionStatus = "succeeded"
+	ActionFailed    ScheduledActionStatus = "failed"
+)
+
+// ScheduledAction publishes, unpublishes or archives one item at a given minute (see
+// ContentSchedules). It is stored apart from the item and is not content: creating or
+// running it does not change the item's draft revision. Error holds why the action failed,
+// or why its last attempt could not run while it is pending again.
+type ScheduledAction struct {
+	ID         string                `json:"id" bson:"_id"`
+	ItemID     string                `json:"itemId" bson:"itemId"`
+	ItemType   ContentType           `json:"itemType" bson:"itemType"`
+	Action     ScheduledActionType   `json:"action" bson:"action"`
+	At         time.Time             `json:"at" bson:"at"`
+	Status     ScheduledActionStatus `json:"status" bson:"status"`
+	Error      string                `json:"error,omitempty" bson:"error,omitempty"`
+	CreatedAt  time.Time             `json:"createdAt" bson:"createdAt"`
+	UpdatedAt  time.Time             `json:"updatedAt" bson:"updatedAt"`
+	ExecutedAt *time.Time            `json:"executedAt,omitempty" bson:"executedAt,omitempty"`
+}
+
+// ScheduleActionInput schedules Action on the matched item at At, which is truncated to
+// the minute and must lie in the future.
+type ScheduleActionInput struct {
+	Match  ContentItemMatch    `json:"match"`
+	Action ScheduledActionType `json:"action"`
+	At     time.Time           `json:"at"`
+}
+
+// ListScheduledActionsInput lists scheduled actions ordered by time (ties by ID): those of
+// the matched item (all items when Match is empty) in the given statuses (all when empty),
+// from From (inclusive) to To (exclusive). Limit defaults to 100 and may be at most 1000;
+// Cursor continues from a previous page's NextCursor.
+type ListScheduledActionsInput struct {
+	Match    ContentItemMatch        `json:"match"`
+	Statuses []ScheduledActionStatus `json:"statuses,omitempty"`
+	From     *time.Time              `json:"from,omitempty"`
+	To       *time.Time              `json:"to,omitempty"`
+	Limit    int                     `json:"limit,omitempty"`
+	Cursor   string                  `json:"cursor,omitempty"`
+}
+
+// ScheduledActionPage is one page of ListScheduledActions. NextCursor is empty on the last
+// page.
+type ScheduledActionPage struct {
+	Items      []ScheduledAction `json:"items"`
+	NextCursor string            `json:"nextCursor,omitempty"`
+}
+
+// ScheduleRun reports one RunDueActions call. Busy means another runner held the lease and
+// nothing ran. Actions are the actions this run processed, in order, with their resulting
+// status: succeeded, failed, or pending again after an internal error.
+type ScheduleRun struct {
+	Busy    bool              `json:"busy,omitempty"`
+	Actions []ScheduledAction `json:"actions"`
+}

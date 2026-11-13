@@ -136,3 +136,52 @@ type TagUpdate struct {
 	SchemaHash    string
 	Now           time.Time
 }
+
+// ScheduleStore is the optional persistence contract for scheduled actions. *Persistor
+// implements it and enables it with WithSchedules; an Engine over a store without it, or
+// with it disabled, rejects scheduled actions, so existing Store implementations keep
+// working unchanged.
+type ScheduleStore interface {
+	Store
+	// SchedulesEnabled reports whether the store keeps scheduled actions.
+	SchedulesEnabled() bool
+	// InsertScheduledAction stores a new action. It returns ErrConflict when the item
+	// already has a pending action at the same time.
+	InsertScheduledAction(ctx context.Context, action *ScheduledAction) error
+	// GetScheduledAction returns the action with the given ID, or ErrNotFound.
+	GetScheduledAction(ctx context.Context, id string) (*ScheduledAction, error)
+	// FindScheduledActions returns the actions matching q, ordered by At, then ID.
+	FindScheduledActions(ctx context.Context, q ScheduledActionQuery) ([]*ScheduledAction, error)
+	// UpdateScheduledAction replaces the stored action if its stored status is one of from,
+	// and returns ErrConflict otherwise, including when it no longer exists.
+	UpdateScheduledAction(ctx context.Context, action *ScheduledAction, from ...ScheduledActionStatus) error
+	// DeleteScheduledActions deletes the actions matching q's ID, ItemID and Statuses (its
+	// other fields are ignored) and returns how many it deleted.
+	DeleteScheduledActions(ctx context.Context, q ScheduledActionQuery) (int64, error)
+	// AcquireScheduleRunner takes the single runner lease for holder until the given time,
+	// or extends it when holder already has it. It returns false while another holder's
+	// lease has not expired.
+	AcquireScheduleRunner(ctx context.Context, holder string, until time.Time) (bool, error)
+	// ReleaseScheduleRunner gives up holder's lease; it is a no-op when holder has none.
+	ReleaseScheduleRunner(ctx context.Context, holder string) error
+}
+
+// ScheduledActionQuery selects scheduled actions. Every set field narrows the selection.
+type ScheduledActionQuery struct {
+	ID       string
+	ItemID   string
+	Statuses []ScheduledActionStatus
+	// From and To bound At: From inclusive, To exclusive.
+	From *time.Time
+	To   *time.Time
+	// After continues after this position in the (At, ID) order (from the start when nil).
+	After *ScheduleCursor
+	// Limit caps the number of actions (unlimited when zero).
+	Limit int
+}
+
+// ScheduleCursor is a position in the (At, ID) order of scheduled actions.
+type ScheduleCursor struct {
+	At time.Time `json:"at"`
+	ID string    `json:"id"`
+}
