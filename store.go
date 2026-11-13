@@ -106,6 +106,29 @@ type TagStore interface {
 	// its weight (highest first, ties by descending ID) after the keyset position q.After.
 	// Results can be projected (see ChildQuery.Fields) and must then never be written back.
 	FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error)
+	// MergeTags writes one item's share of a tag merge, if the item is not archived, its
+	// draft revision is m.ExpectedRevision and its published revision is
+	// m.ExpectedPublishedRevision (nil: it has no published snapshot). It bumps the draft
+	// revision, and a published snapshot of the expected draft revision follows the bump,
+	// so the item's state is unchanged. It returns ErrConflict otherwise, including when
+	// the item no longer exists.
+	MergeTags(ctx context.Context, m TagMerge) (*ContentItem, error)
+}
+
+// TagMerge is a compare-and-swap write of an item's tag sets after merging one tag into
+// another. The published precondition matters because publishing copies the draft
+// without bumping its revision.
+type TagMerge struct {
+	ID                        string
+	ExpectedRevision          int64
+	ExpectedPublishedRevision *int64
+	// DraftTags and PublishedTags are the new complete sets; nil leaves a snapshot's tags
+	// and its timestamp unchanged. A merge never empties a set it changes.
+	DraftTags     TagSet
+	PublishedTags TagSet
+	SchemaVersion string
+	SchemaHash    string
+	Now           time.Time
 }
 
 // TagQuery selects one page of a tag ranking.

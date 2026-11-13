@@ -162,12 +162,7 @@ func (e *Engine) GetTagCounts(ctx context.Context, view SnapshotView, input TagC
 	}
 	types := input.Types
 	if len(types) == 0 {
-		for _, schema := range e.schemas.all() {
-			if schema.Tags != nil {
-				types = append(types, schema.Type)
-			}
-		}
-		if len(types) == 0 {
+		if types = e.taggedTypes(); len(types) == 0 {
 			return &TagCounts{Items: []TagCount{}}, nil
 		}
 	}
@@ -191,4 +186,27 @@ func (e *Engine) GetTagCounts(ctx context.Context, view SnapshotView, input TagC
 		return cmp.Or(cmp.Compare(b.Count, a.Count), strings.Compare(a.ID, b.ID))
 	})
 	return &TagCounts{Items: out[:min(len(out), limit)]}, nil
+}
+
+// taggedTypes returns the registered types that take tags.
+func (e *Engine) taggedTypes() []ContentType {
+	var types []ContentType
+	for _, schema := range e.schemas.all() {
+		if schema.Tags != nil {
+			types = append(types, schema.Type)
+		}
+	}
+	return types
+}
+
+// snapshotTags returns the tags of item's snapshot for view.
+func snapshotTags(item *ContentItem, view SnapshotView) TagSet {
+	snapshot := item.Draft
+	if view == SnapshotViewPublished {
+		snapshot = item.Published
+	}
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.Tags
 }

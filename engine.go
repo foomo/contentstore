@@ -151,7 +151,7 @@ func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDra
 
 	revision := int64(1)
 	createdAt := now
-	var tags TagSet // SaveDraft replaces the fields; tags only change through UpdateTags
+	var tags TagSet // SaveDraft replaces the fields; tags only change through UpdateTags and MergeTags
 	if item.Draft != nil {
 		revision = item.Draft.Revision + 1
 		createdAt = item.Draft.CreatedAt

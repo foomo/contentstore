@@ -354,6 +354,42 @@ func (f *fakeStore) UpdateTags(_ context.Context, u TagUpdate) (*ContentItem, er
 	return cloneContentItem(item), nil
 }
 
+// MergeTags mirrors Persistor.MergeTags: a compare-and-swap on both snapshot revisions.
+func (f *fakeStore) MergeTags(_ context.Context, m TagMerge) (*ContentItem, error) {
+	f.runBeforeWrite()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item := f.items[m.ID]
+	if item == nil || item.ArchivedAt != nil || item.Draft == nil || item.Draft.Revision != m.ExpectedRevision {
+		return nil, ErrConflict
+	}
+	if expected := m.ExpectedPublishedRevision; (expected == nil) != (item.Published == nil) ||
+		expected != nil && item.Published.Revision != *expected {
+		return nil, ErrConflict
+	}
+	draft := *item.Draft
+	draft.Revision++
+	if m.DraftTags != nil {
+		draft.Tags = maps.Clone(m.DraftTags)
+		draft.SchemaVersion, draft.SchemaHash = m.SchemaVersion, m.SchemaHash
+		draft.UpdatedAt = m.Now
+	}
+	if item.Published != nil {
+		published := *item.Published
+		if m.PublishedTags != nil {
+			published.Tags = maps.Clone(m.PublishedTags)
+			published.UpdatedAt = m.Now
+		}
+		if published.Revision == m.ExpectedRevision {
+			published.Revision = draft.Revision
+		}
+		item.Published = &published
+	}
+	item.Draft = &draft
+	item.UpdatedAt = m.Now
+	return cloneContentItem(item), nil
+}
+
 // RunTreeTransaction serializes tree transactions like the persistor's lock document. It
 // has no rollback: engine transactions validate first and write last.
 func (f *fakeStore) RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
@@ -419,18 +455,6 @@ func (f *fakeStore) FindTagged(_ context.Context, q TagQuery) ([]*ContentItem, e
 		out[i] = projectItem(cloneContentItem(it), q.Fields)
 	}
 	return out, nil
-}
-
-// snapshotTags returns the tags of item's snapshot for view.
-func snapshotTags(item *ContentItem, view SnapshotView) TagSet {
-	snapshot := item.Draft
-	if view == SnapshotViewPublished {
-		snapshot = item.Published
-	}
-	if snapshot == nil {
-		return nil
-	}
-	return snapshot.Tags
 }
 
 // projectItem mirrors the persistor's FindChildren projection.

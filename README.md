@@ -10,7 +10,7 @@ It provides:
 - optimistic concurrency and atomic field updates;
 - a schema registry with localized field validation and optional per-field size limits;
 - opt-in content trees (folders) with path lookups and paginated child listings;
-- opt-in weighted tags with filters, index-backed rankings and tag counts;
+- opt-in weighted tags with filters, index-backed rankings, tag counts and tag merges;
 - opt-in scheduled publish, unpublish and archive actions;
 - a MongoDB-backed store and an injectable persistence interface;
 - checksummed export and atomic replacement operations.
@@ -75,7 +75,7 @@ Types without a policy can't be tagged.
   set, and namespaces stand in for several tag fields.
 - **Weight.** A tag's weight is how strongly the tag applies to the item. Unweighted tags weigh 1.
   Item attributes such as ratings or scores belong in fields, not in tags.
-- **Writing.** `UpdateTags` (on `ContentTags`) is the only way to write tags: it adds, re-weights,
+- **Writing.** `UpdateTags` (on `ContentTags`) writes an item's tags: it adds, re-weights,
   removes or replaces them. It's a compare-and-swap on the draft revision, retried on conflict.
   Whole-document writes of tagged items compare-and-swap too, so no concurrent change is lost.
 - **Filters.** `GetSnapshot` and `ListChildren` accept a tag filter (all / any / none of a list of
@@ -87,6 +87,14 @@ Types without a policy can't be tagged.
 - **Counts.** `GetTagCounts` counts tags for facets and autocomplete (with a prefix). It counts in
   memory over the requested types. For very large catalogues it would need an aggregation pipeline
   or a maintained tally instead.
+- **Merging.** `MergeTags` replaces one tag with another on every item that carries it, e.g. to
+  fix a typo (`feedbck` into `feedback`) or move a bare tag into a namespace. It's a cleanup, not
+  an editorial change: it rewrites both the draft and the published tags, and an item keeps its
+  state (a published item stays published, pending edits stay pending). An item carrying both
+  tags keeps the higher weight. The target must be allowed by each item's tag policy; items that
+  reject it are listed in the result and keep the old tag. Archived items keep it too. Each item
+  is its own compare-and-swap, so a merge isn't atomic, but running it again completes an
+  interrupted one. Items whose published tags changed emit `OpMergeTags`, the others `OpSaveDraft`.
 
 In MongoDB, tag IDs become field names: `%`, `.` and `$` are percent-escaped, and so is the first
 character of an all-digit ID. That's transparent to callers.

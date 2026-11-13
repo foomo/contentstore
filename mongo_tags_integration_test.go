@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -286,5 +287,117 @@ func TestTagIndexesSurviveReplaceAllInMongo(t *testing.T) {
 	got := walkRanking(t, e, SnapshotViewPublished, ListTaggedInput{Tag: "topic:a"})
 	if len(got) != 3 || !store.tagHintMissing.Load() {
 		t.Fatalf("ranking without its index = %v (hint dropped: %v)", got, store.tagHintMissing.Load())
+	}
+}
+
+func TestPersistorMergeTagsIsCompareAndSwap(t *testing.T) {
+	ctx := context.Background()
+	e, store := newMongoTreeEngine(t)
+	item := newArticle(t, e)
+	match := ContentItemMatch{ID: item.ID}
+	updateTags(t, e, UpdateTagsInput{Match: match, Set: map[string]*float64{"feedbck": nil}})
+	if _, err := e.Publish(ctx, match); err != nil { // draft and published revision 2
+		t.Fatalf("publish: %v", err)
+	}
+	tags := TagSet{"topic:node.js": 2}
+	for name, m := range map[string]TagMerge{
+		"stale draft revision":     {ExpectedRevision: 1, ExpectedPublishedRevision: new(int64(2))},
+		"stale published revision": {ExpectedRevision: 2, ExpectedPublishedRevision: new(int64(1))},
+		"unexpected publication":   {ExpectedRevision: 2},
+	} {
+		m.ID, m.DraftTags = item.ID, tags
+		if _, err := store.MergeTags(ctx, m); !errors.Is(err, ErrConflict) {
+			t.Fatalf("%s: err = %v, want ErrConflict", name, err)
+		}
+	}
+
+	now := time.Now().UTC()
+	got, err := store.MergeTags(ctx, TagMerge{
+		ID: item.ID, ExpectedRevision: 2, ExpectedPublishedRevision: new(int64(2)),
+		DraftTags: tags, PublishedTags: tags, SchemaVersion: "1", SchemaHash: "hash", Now: now,
+	})
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if got.Draft.Revision != 3 || got.Published.Revision != 3 || got.State() != StatePublished {
+		t.Fatalf("revisions %d/%d state %s: the published snapshot must follow the bump", got.Draft.Revision, got.Published.Revision, got.State())
+	}
+	if !maps.Equal(got.Draft.Tags, tags) || !maps.Equal(got.Published.Tags, tags) || got.Published.Fields["title"]["de"] != "v1" {
+		t.Fatalf("merged item = draft %+v, published %+v", got.Draft, got.Published)
+	}
+	if !got.Published.UpdatedAt.Equal(now.Truncate(time.Millisecond)) || got.Draft.SchemaHash != "hash" {
+		t.Fatalf("published updatedAt %v, draft schema hash %q", got.Published.UpdatedAt, got.Draft.SchemaHash)
+	}
+	var raw bson.M
+	if err := store.coll.FindOne(ctx, bson.D{{Key: "_id", Value: item.ID}}).Decode(&raw); err != nil {
+		t.Fatalf("raw: %v", err)
+	}
+	if _, ok := raw["published"].(bson.M)["tags"].(bson.M)["topic:node%2Ejs"]; !ok {
+		t.Fatalf("published tags must be stored escaped: %v", raw["published"])
+	}
+
+	// With pending edits the published revision stays, and nil tags leave a snapshot alone.
+	if _, err := e.SaveDraft(ctx, SaveDraftInput{Match: match, Fields: titleFields("v2")}); err != nil { // revision 4
+		t.Fatalf("save draft: %v", err)
+	}
+	publishedAt := got.Published.UpdatedAt
+	got, err = store.MergeTags(ctx, TagMerge{ID: item.ID, ExpectedRevision: 4, ExpectedPublishedRevision: new(int64(3)), DraftTags: TagSet{"go": 1}, Now: time.Now().UTC()})
+	if err != nil {
+		t.Fatalf("merge with pending edits: %v", err)
+	}
+	if got.Draft.Revision != 5 || got.Published.Revision != 3 || got.State() != StateChanged ||
+		!maps.Equal(got.Published.Tags, tags) || !got.Published.UpdatedAt.Equal(publishedAt) {
+		t.Fatalf("draft %+v, published %+v", got.Draft, got.Published)
+	}
+
+	// An unpublished item matches "no published snapshot"; an archived one never matches.
+	draft := newArticle(t, e)
+	if _, err := store.MergeTags(ctx, TagMerge{ID: draft.ID, ExpectedRevision: 1, DraftTags: tags, Now: now}); err != nil {
+		t.Fatalf("merge into a draft: %v", err)
+	}
+	if _, err := e.Archive(ctx, ContentItemMatch{ID: draft.ID}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if _, err := store.MergeTags(ctx, TagMerge{ID: draft.ID, ExpectedRevision: 2, DraftTags: tags, Now: now}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archived item: err = %v, want ErrConflict", err)
+	}
+}
+
+func TestMergeTagsInMongo(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newMongoTreeEngine(t, WithTagIndexes())
+	var published []string
+	for i := range 4 {
+		item := updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: newArticle(t, e).ID}, Set: map[string]*float64{
+			"topic:databse": new(float64(i)), "go": nil,
+		}})
+		if i%2 == 0 {
+			if _, err := e.Publish(ctx, ContentItemMatch{ID: item.ID}); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			published = append(published, item.ID)
+		}
+	}
+	res, err := e.MergeTags(ctx, MergeTagsInput{From: "topic:databse", To: "topic:database"})
+	if err != nil || res.Merged != 4 || len(res.Failed) != 0 {
+		t.Fatalf("merge = %+v, %v", res, err)
+	}
+	for view, want := range map[SnapshotView][]TagCount{
+		SnapshotViewPreview:   {{ID: "go", Count: 4}, {ID: "topic:database", Count: 4}},
+		SnapshotViewPublished: {{ID: "go", Count: 2}, {ID: "topic:database", Count: 2}},
+	} {
+		counts, err := e.GetTagCounts(ctx, view, TagCountsInput{})
+		if err != nil || !slices.Equal(counts.Items, want) {
+			t.Fatalf("%s tag counts = %+v, %v; want %+v", view, counts, err, want)
+		}
+	}
+	page, err := e.ListTagged(ctx, SnapshotViewPublished, ListTaggedInput{Tag: "topic:database"})
+	if err != nil || len(page.Items) != 2 || page.Items[0].ID != published[1] || page.Items[0].Tags["topic:database"] != 2 {
+		t.Fatalf("published ranking = %+v, %v", page, err)
+	}
+	for _, id := range published {
+		if got := getItem(t, e, id); got.State() != StatePublished {
+			t.Fatalf("item %s state = %s, want published", id, got.State())
+		}
 	}
 }

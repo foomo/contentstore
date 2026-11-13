@@ -209,6 +209,11 @@ func (r *recordingStore) FindTagged(ctx context.Context, q TagQuery) ([]*Content
 	return r.inner.FindTagged(ctx, q)
 }
 
+func (r *recordingStore) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, error) {
+	r.record("MergeTags(%s,expected=%d)", m.ID, m.ExpectedRevision)
+	return r.inner.MergeTags(ctx, m)
+}
+
 // compatStep is one ContentStore operation of the legacy-type scenario.
 type compatStep struct {
 	name string

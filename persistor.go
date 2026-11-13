@@ -687,6 +687,54 @@ func (p *Persistor) UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, 
 	return item, nil
 }
 
+// MergeTags writes one item's tag merge as a single targeted update guarded by both
+// snapshot revisions; ErrConflict when the item changed since it was read.
+func (p *Persistor) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, error) {
+	filter := bson.D{
+		{Key: "_id", Value: m.ID},
+		{Key: "archivedAt", Value: nil},
+		{Key: "draft.revision", Value: m.ExpectedRevision},
+	}
+	if m.ExpectedPublishedRevision == nil {
+		filter = append(filter, bson.E{Key: "published", Value: nil})
+	} else {
+		filter = append(filter, bson.E{Key: "published.revision", Value: *m.ExpectedPublishedRevision})
+	}
+	set := bson.D{{Key: "updatedAt", Value: m.Now}}
+	if m.DraftTags != nil {
+		set = append(set,
+			bson.E{Key: "draft.tags", Value: tagsDocument(m.DraftTags)},
+			bson.E{Key: "draft.updatedAt", Value: m.Now},
+			bson.E{Key: "draft.schemaVersion", Value: m.SchemaVersion},
+			bson.E{Key: "draft.schemaHash", Value: m.SchemaHash},
+		)
+	}
+	if m.ExpectedPublishedRevision != nil {
+		if m.PublishedTags != nil {
+			set = append(set,
+				bson.E{Key: "published.tags", Value: tagsDocument(m.PublishedTags)},
+				bson.E{Key: "published.updatedAt", Value: m.Now},
+			)
+		}
+		if *m.ExpectedPublishedRevision == m.ExpectedRevision {
+			set = append(set, bson.E{Key: "published.revision", Value: m.ExpectedRevision + 1})
+		}
+	}
+	update := bson.D{
+		{Key: "$set", Value: set},
+		{Key: "$inc", Value: bson.D{{Key: "draft.revision", Value: int64(1)}}},
+	}
+	item := &ContentItem{}
+	err := p.coll.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(item)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: merge tags: %w", err)
+	}
+	return item, nil
+}
+
 // ensureTagIndexes creates the tag ranking indexes: a compound wildcard index per snapshot
 // whose _id suffix makes "carries tag X, by X's weight, ties by _id" an index scan,
 // including keyset pages. Documents without tags have no wildcard entries.

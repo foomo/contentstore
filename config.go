@@ -43,6 +43,9 @@ const (
 	OpDelete       = "delete"
 	OpContentReset = "contentReset"
 	OpMove         = "move"
+	// OpMergeTags reports a tag merge that changed an item's published tags; a merge that
+	// changed only its draft tags reports OpSaveDraft.
+	OpMergeTags = "mergeTags"
 )
 
 // ContentChange describes a successful content write so consuming applications

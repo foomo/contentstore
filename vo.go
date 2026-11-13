@@ -233,7 +233,7 @@ type ArchivedContentItem struct {
 	UpdatedAt  time.Time     `json:"updatedAt"`
 }
 
-// UpdateTagsInput changes an item's draft tags, the only way to write tags. Set adds tags
+// UpdateTagsInput changes an item's draft tags (MergeTags is the other tag write). Set adds tags
 // or changes their weights (a nil weight is 1); Remove drops tags; with Replace, Set
 // becomes the complete set (and Remove must be empty), so an empty Set clears all tags.
 type UpdateTagsInput struct {
@@ -241,6 +241,28 @@ type UpdateTagsInput struct {
 	Set     map[string]*float64 `json:"set,omitempty"`
 	Remove  []string            `json:"remove,omitempty"`
 	Replace bool                `json:"replace,omitempty"`
+}
+
+// MergeTagsInput merges tag From into tag To on the live items of Types (every type that
+// takes tags when empty), in both their draft and published snapshots. From may be any
+// stored tag; To must be allowed by each item's tag policy.
+type MergeTagsInput struct {
+	From  string        `json:"from"`
+	To    string        `json:"to"`
+	Types []ContentType `json:"types,omitempty"`
+}
+
+// MergeTagsResult reports a tag merge: how many items changed, and the items that could
+// not be merged, which keep tag From.
+type MergeTagsResult struct {
+	Merged int                `json:"merged"`
+	Failed []MergeTagsFailure `json:"failed,omitempty"`
+}
+
+// MergeTagsFailure is an item a tag merge could not change, and why.
+type MergeTagsFailure struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
 }
 
 // ListChildrenInput lists the children of ParentID (named root-level items when empty),
