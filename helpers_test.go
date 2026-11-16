@@ -367,17 +367,24 @@ func (f *fakeStore) MergeTags(_ context.Context, m TagMerge) (*ContentItem, erro
 		expected != nil && item.Published.Revision != *expected {
 		return nil, ErrConflict
 	}
+	// Like the persistor, an emptied set is stored as no tags.
+	tagsOrNil := func(tags TagSet) TagSet {
+		if len(tags) == 0 {
+			return nil
+		}
+		return maps.Clone(tags)
+	}
 	draft := *item.Draft
 	draft.Revision++
 	if m.DraftTags != nil {
-		draft.Tags = maps.Clone(m.DraftTags)
+		draft.Tags = tagsOrNil(m.DraftTags)
 		draft.SchemaVersion, draft.SchemaHash = m.SchemaVersion, m.SchemaHash
 		draft.UpdatedAt = m.Now
 	}
 	if item.Published != nil {
 		published := *item.Published
 		if m.PublishedTags != nil {
-			published.Tags = maps.Clone(m.PublishedTags)
+			published.Tags = tagsOrNil(m.PublishedTags)
 			published.UpdatedAt = m.Now
 		}
 		if published.Revision == m.ExpectedRevision {

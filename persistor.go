@@ -701,9 +701,18 @@ func (p *Persistor) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, er
 		filter = append(filter, bson.E{Key: "published.revision", Value: *m.ExpectedPublishedRevision})
 	}
 	set := bson.D{{Key: "updatedAt", Value: m.Now}}
+	unset := bson.D{}
+	// An emptied set is unset, as UpdateTags stores an item without tags.
+	setTags := func(field string, tags TagSet) {
+		if len(tags) == 0 {
+			unset = append(unset, bson.E{Key: field, Value: ""})
+		} else {
+			set = append(set, bson.E{Key: field, Value: tagsDocument(tags)})
+		}
+	}
 	if m.DraftTags != nil {
+		setTags("draft.tags", m.DraftTags)
 		set = append(set,
-			bson.E{Key: "draft.tags", Value: tagsDocument(m.DraftTags)},
 			bson.E{Key: "draft.updatedAt", Value: m.Now},
 			bson.E{Key: "draft.schemaVersion", Value: m.SchemaVersion},
 			bson.E{Key: "draft.schemaHash", Value: m.SchemaHash},
@@ -711,10 +720,8 @@ func (p *Persistor) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, er
 	}
 	if m.ExpectedPublishedRevision != nil {
 		if m.PublishedTags != nil {
-			set = append(set,
-				bson.E{Key: "published.tags", Value: tagsDocument(m.PublishedTags)},
-				bson.E{Key: "published.updatedAt", Value: m.Now},
-			)
+			setTags("published.tags", m.PublishedTags)
+			set = append(set, bson.E{Key: "published.updatedAt", Value: m.Now})
 		}
 		if *m.ExpectedPublishedRevision == m.ExpectedRevision {
 			set = append(set, bson.E{Key: "published.revision", Value: m.ExpectedRevision + 1})
@@ -723,6 +730,9 @@ func (p *Persistor) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, er
 	update := bson.D{
 		{Key: "$set", Value: set},
 		{Key: "$inc", Value: bson.D{{Key: "draft.revision", Value: int64(1)}}},
+	}
+	if len(unset) > 0 {
+		update = append(update, bson.E{Key: "$unset", Value: unset})
 	}
 	item := &ContentItem{}
 	err := p.coll.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(item)

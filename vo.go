@@ -233,7 +233,8 @@ type ArchivedContentItem struct {
 	UpdatedAt  time.Time     `json:"updatedAt"`
 }
 
-// UpdateTagsInput changes an item's draft tags (MergeTags is the other tag write). Set adds tags
+// UpdateTagsInput changes an item's draft tags (MergeTags and DeleteTag are the other tag
+// writes). Set adds tags
 // or changes their weights (a nil weight is 1); Remove drops tags; with Replace, Set
 // becomes the complete set (and Remove must be empty), so an empty Set clears all tags.
 type UpdateTagsInput struct {
@@ -255,12 +256,26 @@ type MergeTagsInput struct {
 // MergeTagsResult reports a tag merge: how many items changed, and the items that could
 // not be merged, which keep tag From.
 type MergeTagsResult struct {
-	Merged int                `json:"merged"`
-	Failed []MergeTagsFailure `json:"failed,omitempty"`
+	Merged int               `json:"merged"`
+	Failed []TagWriteFailure `json:"failed,omitempty"`
 }
 
-// MergeTagsFailure is an item a tag merge could not change, and why.
-type MergeTagsFailure struct {
+// DeleteTagInput deletes tag Tag from the live items of Types (every type that takes tags
+// when empty), from both their draft and published snapshots. Tag may be any stored tag.
+type DeleteTagInput struct {
+	Tag   string        `json:"tag"`
+	Types []ContentType `json:"types,omitempty"`
+}
+
+// DeleteTagResult reports a tag deletion: how many items changed, and the items that could
+// not be changed, which keep the tag.
+type DeleteTagResult struct {
+	Deleted int               `json:"deleted"`
+	Failed  []TagWriteFailure `json:"failed,omitempty"`
+}
+
+// TagWriteFailure is an item a tag merge or deletion could not change, and why.
+type TagWriteFailure struct {
 	ID    string `json:"id"`
 	Error string `json:"error"`
 }

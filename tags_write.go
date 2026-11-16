@@ -16,9 +16,11 @@ type ContentTags interface {
 	ListTagged(ctx context.Context, view SnapshotView, input ListTaggedInput) (*ItemPage, error)
 	GetTagCounts(ctx context.Context, view SnapshotView, input TagCountsInput) (*TagCounts, error)
 	MergeTags(ctx context.Context, input MergeTagsInput) (*MergeTagsResult, error)
+	DeleteTag(ctx context.Context, input DeleteTagInput) (*DeleteTagResult, error)
 }
 
-// mergeTagsBatchSize is how many carriers of the merged tag one ranking query fetches.
+// mergeTagsBatchSize is how many carriers of a merged or deleted tag one ranking query
+// fetches.
 const mergeTagsBatchSize = 1000
 
 var _ ContentTags = (*Engine)(nil)
@@ -148,34 +150,71 @@ func (e *Engine) MergeTags(ctx context.Context, input MergeTagsInput) (*MergeTag
 	if input.From == input.To {
 		return nil, badRequest("from and to must differ")
 	}
-	if e.tags == nil {
-		return nil, internalErr(nil, "store does not support tags")
-	}
-	types := input.Types
-	if len(types) == 0 {
-		if types = e.taggedTypes(); len(types) == 0 {
-			return &MergeTagsResult{}, nil
-		}
-	}
-	ids, err := e.tagCarriers(ctx, input.From, types)
+	merged, failed, err := e.rewriteTags(ctx, input.From, input.Types, OpMergeTags, func(typ ContentType, policy *TagPolicy, tags TagSet) (TagSet, error) {
+		return mergeTagInto(typ, policy, tags, input.From, input.To)
+	})
 	if err != nil {
 		return nil, err
 	}
-	result := &MergeTagsResult{}
+	return &MergeTagsResult{Merged: merged, Failed: failed}, nil
+}
+
+// DeleteTag removes tag Tag from every live item of Types that carries it, from its draft
+// and its published snapshot, so the tag is gone from both views at once. Like MergeTags it
+// changes one item at a time, as a compare-and-swap on both snapshot revisions, bumps the
+// draft revision but keeps the item's state, and can be repeated to complete an interrupted
+// deletion. It emits OpDeleteTag for items whose published tags changed and OpSaveDraft for
+// the others. Archived items keep the tag; a store error aborts.
+func (e *Engine) DeleteTag(ctx context.Context, input DeleteTagInput) (*DeleteTagResult, error) {
+	// Like a removal, any stored key can be deleted, so malformed imported tags can go too.
+	if input.Tag == "" {
+		return nil, badRequest("tag is required")
+	}
+	deleted, failed, err := e.rewriteTags(ctx, input.Tag, input.Types, OpDeleteTag, func(_ ContentType, _ *TagPolicy, tags TagSet) (TagSet, error) {
+		return withoutTag(tags, input.Tag), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &DeleteTagResult{Deleted: deleted, Failed: failed}, nil
+}
+
+// tagRewrite computes an item snapshot's new tag set, or nil when it has nothing to change.
+type tagRewrite func(typ ContentType, policy *TagPolicy, tags TagSet) (TagSet, error)
+
+// rewriteTags applies rewrite to the draft and published tags of every live item of types
+// (every type that takes tags when empty) carrying tag. It returns how many items changed
+// and the items rewrite rejected; publishedOp is the event of an item whose published tags
+// changed.
+func (e *Engine) rewriteTags(ctx context.Context, tag string, types []ContentType, publishedOp string, rewrite tagRewrite) (int, []TagWriteFailure, error) {
+	if e.tags == nil {
+		return 0, nil, internalErr(nil, "store does not support tags")
+	}
+	if len(types) == 0 {
+		if types = e.taggedTypes(); len(types) == 0 {
+			return 0, nil, nil
+		}
+	}
+	ids, err := e.tagCarriers(ctx, tag, types)
+	if err != nil {
+		return 0, nil, err
+	}
+	changed := 0
+	var failed []TagWriteFailure
 	for _, id := range ids {
-		item, op, err := e.mergeItemTags(ctx, id, input.From, input.To)
+		item, op, err := e.rewriteItemTags(ctx, id, publishedOp, rewrite)
 		var failure *Error
 		switch {
 		case errors.As(err, &failure) && failure.Kind != KindInternal:
-			result.Failed = append(result.Failed, MergeTagsFailure{ID: id, Error: failure.Msg})
+			failed = append(failed, TagWriteFailure{ID: id, Error: failure.Msg})
 		case err != nil:
-			return nil, err
+			return 0, nil, err
 		case item != nil:
-			result.Merged++
+			changed++
 			e.emit(item, op)
 		}
 	}
-	return result, nil
+	return changed, failed, nil
 }
 
 // tagCarriers returns the IDs of the live items of types carrying tag in their draft or
@@ -207,10 +246,10 @@ func (e *Engine) tagCarriers(ctx context.Context, tag string, types []ContentTyp
 	return ids, nil
 }
 
-// mergeItemTags merges from into to on one item. It returns the written item and the op to
-// emit, or no item when there is nothing (left) to merge: the item is gone, archived, or no
-// longer carries from.
-func (e *Engine) mergeItemTags(ctx context.Context, id, from, to string) (*ContentItem, string, error) {
+// rewriteItemTags rewrites one item's tags. It returns the written item and the op to emit,
+// or no item when there is nothing (left) to change: the item is gone, archived, or rewrite
+// leaves both snapshots alone.
+func (e *Engine) rewriteItemTags(ctx context.Context, id, publishedOp string, rewrite tagRewrite) (*ContentItem, string, error) {
 	var op string
 	item, err := retryConflicts(func() (*ContentItem, bool, error) {
 		item, err := e.resolveOptional(ctx, ContentItemMatch{ID: id})
@@ -221,11 +260,11 @@ func (e *Engine) mergeItemTags(ctx context.Context, id, from, to string) (*Conte
 			return nil, false, notAcceptable("item has no draft")
 		}
 		schema, _ := e.schemas.schemaFor(item.Type)
-		draftTags, err := mergeTagInto(item.Type, schema.Tags, item.Draft.Tags, from, to)
+		draftTags, err := rewrite(item.Type, schema.Tags, item.Draft.Tags)
 		if err != nil {
 			return nil, false, err
 		}
-		merge := TagMerge{
+		write := TagMerge{
 			ID:               item.ID,
 			ExpectedRevision: item.Draft.Revision,
 			DraftTags:        draftTags,
@@ -234,28 +273,39 @@ func (e *Engine) mergeItemTags(ctx context.Context, id, from, to string) (*Conte
 			Now:              time.Now().UTC(),
 		}
 		if item.Published != nil {
-			merge.ExpectedPublishedRevision = new(item.Published.Revision)
-			if merge.PublishedTags, err = mergeTagInto(item.Type, schema.Tags, item.Published.Tags, from, to); err != nil {
+			write.ExpectedPublishedRevision = new(item.Published.Revision)
+			if write.PublishedTags, err = rewrite(item.Type, schema.Tags, item.Published.Tags); err != nil {
 				return nil, false, err
 			}
 		}
-		if merge.DraftTags == nil && merge.PublishedTags == nil {
+		if write.DraftTags == nil && write.PublishedTags == nil {
 			return nil, false, nil
 		}
-		written, err := e.tags.MergeTags(ctx, merge)
+		written, err := e.tags.MergeTags(ctx, write)
 		if errors.Is(err, ErrConflict) {
 			return nil, true, nil
 		}
 		if err != nil {
-			return nil, false, internalErr(err, "merge tags failed")
+			return nil, false, internalErr(err, "rewrite tags failed")
 		}
 		op = OpSaveDraft
-		if merge.PublishedTags != nil {
-			op = OpMergeTags
+		if write.PublishedTags != nil {
+			op = publishedOp
 		}
 		return written, false, nil
 	})
 	return item, op, err
+}
+
+// withoutTag returns tags without tag, or nil when tags lack it. The result is empty, not
+// nil, when tag was the only one.
+func withoutTag(tags TagSet, tag string) TagSet {
+	if _, ok := tags[tag]; !ok {
+		return nil
+	}
+	next := maps.Clone(tags)
+	delete(next, tag)
+	return next
 }
 
 // mergeTagInto returns tags with from merged into to, or nil when tags lack from. To keeps

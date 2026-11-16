@@ -123,7 +123,8 @@ type TagMerge struct {
 	ExpectedRevision          int64
 	ExpectedPublishedRevision *int64
 	// DraftTags and PublishedTags are the new complete sets; nil leaves a snapshot's tags
-	// and its timestamp unchanged. A merge never empties a set it changes.
+	// and its timestamp unchanged, and an empty set removes its tags (a tag deletion can
+	// empty a set; a merge never does).
 	DraftTags     TagSet
 	PublishedTags TagSet
 	SchemaVersion string

@@ -401,3 +401,31 @@ func TestMergeTagsInMongo(t *testing.T) {
 		}
 	}
 }
+
+func TestDeleteTagInMongo(t *testing.T) {
+	ctx := context.Background()
+	e, _ := newMongoTreeEngine(t, WithTagIndexes())
+	onlyTag := updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: newArticle(t, e).ID}, Set: map[string]*float64{"obsolete": nil}})
+	twoTags := updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: newArticle(t, e).ID}, Set: map[string]*float64{"obsolete": nil, "go": nil}})
+	for _, item := range []*ContentItem{onlyTag, twoTags} {
+		if _, err := e.Publish(ctx, ContentItemMatch{ID: item.ID}); err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+	}
+	res, err := e.DeleteTag(ctx, DeleteTagInput{Tag: "obsolete"})
+	if err != nil || res.Deleted != 2 || len(res.Failed) != 0 {
+		t.Fatalf("delete = %+v, %v", res, err)
+	}
+	// Deleting an item's only tag leaves it without tags in both snapshots.
+	if got := getItem(t, e, onlyTag.ID); got.Draft.Tags != nil || got.Published.Tags != nil || got.State() != StatePublished {
+		t.Fatalf("only tag: draft %v, published %v, state %s", got.Draft.Tags, got.Published.Tags, got.State())
+	}
+	if got := getItem(t, e, twoTags.ID); !maps.Equal(got.Draft.Tags, TagSet{"go": 1}) || !maps.Equal(got.Published.Tags, TagSet{"go": 1}) || got.State() != StatePublished {
+		t.Fatalf("two tags: draft %v, published %v, state %s", got.Draft.Tags, got.Published.Tags, got.State())
+	}
+	for _, view := range []SnapshotView{SnapshotViewPreview, SnapshotViewPublished} {
+		if page, err := e.ListTagged(ctx, view, ListTaggedInput{Tag: "obsolete"}); err != nil || len(page.Items) != 0 {
+			t.Fatalf("%s ranking of the deleted tag = %+v, %v", view, page, err)
+		}
+	}
+}

@@ -348,7 +348,7 @@ func TestMergeTagsReportsRejectedItems(t *testing.T) {
 
 	input.Types = nil
 	res := mergeTagsOK(t, e, input)
-	want := []MergeTagsFailure{{ID: doc.ID, Error: `tag "audience:developers": namespace "audience" is not allowed`}}
+	want := []TagWriteFailure{{ID: doc.ID, Error: `tag "audience:developers": namespace "audience" is not allowed`}}
 	if res.Merged != 0 || !slices.Equal(res.Failed, want) {
 		t.Fatalf("result = %+v, want failures %+v", res, want)
 	}
@@ -372,6 +372,136 @@ func TestMergeTagsRejects(t *testing.T) {
 			t.Errorf("%s: err = %v, want a bad request", name, err)
 		}
 	}
+}
+
+func TestDeleteTag(t *testing.T) {
+	ctx := context.Background()
+	e := newTagEngine(newFakeStore())
+	notifier := &recordingNotifier{}
+	e.notify = notifier.record
+	tagged := func(tags ...string) *ContentItem {
+		t.Helper()
+		set := map[string]*float64{}
+		for _, tag := range tags {
+			set[tag] = nil
+		}
+		return updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: newArticle(t, e).ID}, Set: set})
+	}
+	publish := func(item *ContentItem) *ContentItem {
+		t.Helper()
+		published, err := e.Publish(ctx, ContentItemMatch{ID: item.ID})
+		if err != nil {
+			t.Fatalf("publish: %v", err)
+		}
+		return published
+	}
+
+	draftOnly := tagged("obsolete", "go")
+	published := publish(tagged("obsolete", "go"))
+	onlyTag := publish(tagged("obsolete"))
+	pending := publish(tagged("obsolete"))
+	if _, err := e.SaveDraft(ctx, SaveDraftInput{Match: ContentItemMatch{ID: pending.ID}, Fields: titleFields("v2")}); err != nil {
+		t.Fatalf("save draft: %v", err)
+	}
+	publishedOnly := publish(tagged("obsolete", "go"))
+	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: publishedOnly.ID}, Remove: []string{"obsolete"}})
+	archived := tagged("obsolete")
+	if _, err := e.Archive(ctx, ContentItemMatch{ID: archived.ID}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	other := tagged("go")
+	before := map[string]*ContentItem{}
+	for _, item := range []*ContentItem{draftOnly, published, onlyTag, pending, publishedOnly, archived, other} {
+		before[item.ID] = getItem(t, e, item.ID)
+	}
+	notifier.changes = nil
+
+	res, err := e.DeleteTag(ctx, DeleteTagInput{Tag: "obsolete"})
+	if err != nil || res.Deleted != 5 || len(res.Failed) != 0 {
+		t.Fatalf("result = %+v, %v; want 5 deleted", res, err)
+	}
+	check := func(name string, item *ContentItem, draftTags, publishedTags TagSet, state string) *ContentItem {
+		t.Helper()
+		got := getItem(t, e, item.ID)
+		if !maps.Equal(got.Draft.Tags, draftTags) {
+			t.Errorf("%s: draft tags = %v, want %v", name, got.Draft.Tags, draftTags)
+		}
+		if got.Published != nil && !maps.Equal(got.Published.Tags, publishedTags) {
+			t.Errorf("%s: published tags = %v, want %v", name, got.Published.Tags, publishedTags)
+		}
+		if got.State() != state {
+			t.Errorf("%s: state = %s, want %s", name, got.State(), state)
+		}
+		if got.Draft.Revision != before[item.ID].Draft.Revision+1 {
+			t.Errorf("%s: draft revision = %d, want %d", name, got.Draft.Revision, before[item.ID].Draft.Revision+1)
+		}
+		return got
+	}
+	check("draft only", draftOnly, TagSet{"go": 1}, nil, StateDraft)
+	check("published", published, TagSet{"go": 1}, TagSet{"go": 1}, StatePublished)
+	check("only tag", onlyTag, nil, nil, StatePublished)
+	got := check("pending edits", pending, nil, nil, StateChanged)
+	if got.Draft.Fields["title"]["de"] != "v2" || got.Published.Fields["title"]["de"] != "v1" {
+		t.Errorf("pending edits must stay pending: draft %v, published %v", got.Draft.Fields, got.Published.Fields)
+	}
+	check("published only", publishedOnly, TagSet{"go": 1}, TagSet{"go": 1}, StateChanged)
+	for _, item := range []*ContentItem{archived, other} {
+		if got := getItem(t, e, item.ID); got.Draft.Revision != before[item.ID].Draft.Revision || !maps.Equal(got.Draft.Tags, before[item.ID].Draft.Tags) {
+			t.Errorf("item %s must be untouched: %+v", item.ID, got.Draft)
+		}
+	}
+
+	ops := map[string]string{}
+	for _, c := range notifier.changes {
+		ops[c.ID] = c.Op
+	}
+	wantOps := map[string]string{
+		draftOnly.ID: OpSaveDraft,
+		published.ID: OpDeleteTag, onlyTag.ID: OpDeleteTag, pending.ID: OpDeleteTag, publishedOnly.ID: OpDeleteTag,
+	}
+	if len(notifier.changes) != len(wantOps) || !maps.Equal(ops, wantOps) {
+		t.Errorf("events = %+v, want ops %v", notifier.changes, wantOps)
+	}
+
+	for view, want := range map[SnapshotView][]TagCount{
+		SnapshotViewPreview:   {{ID: "go", Count: 4}},
+		SnapshotViewPublished: {{ID: "go", Count: 2}},
+	} {
+		counts, err := e.GetTagCounts(ctx, view, TagCountsInput{})
+		if err != nil || !slices.Equal(counts.Items, want) {
+			t.Errorf("%s tag counts = %+v, %v; want %+v", view, counts, err, want)
+		}
+	}
+
+	// Repeating the deletion finds nothing left to do.
+	notifier.changes = nil
+	if res, err := e.DeleteTag(ctx, DeleteTagInput{Tag: "obsolete"}); err != nil || res.Deleted != 0 || len(res.Failed) != 0 || len(notifier.changes) != 0 {
+		t.Fatalf("repeated deletion = %+v, %v, events %+v", res, err, notifier.changes)
+	}
+}
+
+func TestDeleteTagNarrowsByType(t *testing.T) {
+	e := newTagEngine(newFakeStore())
+	article := updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: newArticle(t, e).ID}, Set: map[string]*float64{"devs": nil}})
+	doc := place(t, e, documentType, "", "doc")
+	updateTags(t, e, UpdateTagsInput{Match: ContentItemMatch{ID: doc.ID}, Set: map[string]*float64{"devs": nil}})
+
+	res, err := e.DeleteTag(context.Background(), DeleteTagInput{Tag: "devs", Types: []ContentType{articleType}})
+	if err != nil || res.Deleted != 1 {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	if got := getItem(t, e, article.ID); len(got.Draft.Tags) != 0 {
+		t.Errorf("article tags = %v, want none", got.Draft.Tags)
+	}
+	if got := getItem(t, e, doc.ID); !maps.Equal(got.Draft.Tags, TagSet{"devs": 1}) {
+		t.Errorf("documents are not in Types and must keep the tag: %v", got.Draft.Tags)
+	}
+}
+
+func TestDeleteTagRejects(t *testing.T) {
+	e := newTagEngine(newFakeStore())
+	_, err := e.DeleteTag(context.Background(), DeleteTagInput{})
+	wantKind(t, err, KindBadRequest)
 }
 
 func TestMergeTagInto(t *testing.T) {

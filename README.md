@@ -95,6 +95,10 @@ Types without a policy can't be tagged.
   reject it are listed in the result and keep the old tag. Archived items keep it too. Each item
   is its own compare-and-swap, so a merge isn't atomic, but running it again completes an
   interrupted one. Items whose published tags changed emit `OpMergeTags`, the others `OpSaveDraft`.
+- **Deleting.** `DeleteTag` removes one tag from every item that carries it, e.g. a tag nobody
+  should use any more. Like a merge it's a cleanup: it rewrites both the draft and the published
+  tags, keeps each item's state, leaves archived items alone, and can be repeated to complete an
+  interrupted run. Items whose published tags changed emit `OpDeleteTag`, the others `OpSaveDraft`.
 
 In MongoDB, tag IDs become field names: `%`, `.` and `$` are percent-escaped, and so is the first
 character of an all-digit ID. That's transparent to callers.
