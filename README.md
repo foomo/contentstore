@@ -127,6 +127,13 @@ Without the option nothing is created in MongoDB, and the scheduling methods (on
   - Actions go through `Publish`, `Unpublish` and `Archive`, so they validate, guard and emit change
     events exactly like manual calls. A publish takes the draft as it is when the action runs.
   - Actions that were due while nothing ran catch up in order on the next run.
+  - The run renews its lease while an action executes. If it loses the lease anyway, it stops the
+    action through its context and leaves the outcome to the run that took over.
+- **Executing.** `Deps.ScheduleExecutor` lets the application run due actions itself, e.g. to apply
+  an action scheduled on a folder to the items in it as they are when it runs. The engine still
+  stores, orders, claims, records and lists the actions. The executor gets the action and the
+  built-in operation, so it can pass on the actions it doesn't handle. Its error decides the outcome
+  like a built-in one's (below), so it must be safe to repeat.
 - **Outcomes.** A successful action becomes `succeeded`.
   - An action that fails for a content reason, e.g. a missing required field or an item that no
     longer exists, becomes `failed` with the error and isn't retried.

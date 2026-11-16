@@ -257,7 +257,7 @@ func TestCancelAndClaimExcludeEachOtherInMongo(t *testing.T) {
 	if ok, err := e.CancelScheduledAction(ctx, cancelled.ID); err != nil || !ok {
 		t.Fatalf("cancel = %v, %v", ok, err)
 	}
-	if done, err := e.runAction(ctx, cancelled); err != nil || done != nil {
+	if done, err := e.runAction(ctx, "holder", cancelled); err != nil || done != nil {
 		t.Fatalf("a cancelled action was claimed: %#v, %v", done, err)
 	}
 }

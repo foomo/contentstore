@@ -3,8 +3,10 @@ package contentstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -263,11 +265,173 @@ func TestRunActionSkipsCancelledActions(t *testing.T) {
 		t.Fatalf("cancel = %v, %v", cancelled, err)
 	}
 	// The run read the action before it was cancelled.
-	done, err := e.runAction(ctx, action)
+	done, err := e.runAction(ctx, "holder", action)
 	if err != nil || done != nil {
 		t.Fatalf("runAction = %#v, %v", done, err)
 	}
 	if got := getItem(t, e, action.ItemID).State(); got != StateDraft {
 		t.Fatalf("a cancelled action ran: state %s", got)
+	}
+}
+
+func TestRunDueActionsUsesTheExecutor(t *testing.T) {
+	store := newFakeScheduleStore()
+	e := newScheduleEngine(store, nil)
+	base := scheduleBase()
+	type outcome struct {
+		err      error
+		delegate bool
+	}
+	behaviour := map[string]outcome{}
+	var scheduled []*ScheduledAction
+	for i, o := range []outcome{
+		{delegate: true},
+		{},
+		{err: &Error{Kind: KindNotAcceptable, Msg: "not now"}},
+		{err: errors.New("flaky")},
+	} {
+		key := fmt.Sprintf("k%d", i)
+		seedPublishable(t, e, key, "o1")
+		action := mustSchedule(t, e, key, ActionPublish, base)
+		behaviour[action.ItemID] = o
+		scheduled = append(scheduled, action)
+	}
+	var seen []ScheduledAction
+	e.execute = func(ctx context.Context, action ScheduledAction, builtin func(context.Context) error) error {
+		seen = append(seen, action)
+		o := behaviour[action.ItemID]
+		if o.delegate {
+			return builtin(ctx)
+		}
+		return o.err
+	}
+
+	run := mustRun(t, e, base)
+	if len(seen) != 4 || seen[0].Status != ActionRunning {
+		t.Fatalf("executor saw %#v", seen)
+	}
+	want := []struct {
+		status ScheduledActionStatus
+		err    string
+		state  string
+	}{
+		{ActionSucceeded, "", StatePublished}, // delegated to the built-in publish
+		{ActionSucceeded, "", StateDraft},     // handled by the executor alone
+		{ActionFailed, "not now", StateDraft},
+		{ActionPending, "flaky", StateDraft},
+	}
+	byItem := map[string]ScheduledAction{}
+	for _, a := range run.Actions {
+		byItem[a.ItemID] = a
+	}
+	for i, w := range want {
+		action := scheduled[i]
+		got := byItem[action.ItemID]
+		if got.Status != w.status || got.Error != w.err {
+			t.Errorf("action %d = %s %q, want %s %q", i, got.Status, got.Error, w.status, w.err)
+		}
+		if stored := store.action(t, action.ID); stored.Status != w.status {
+			t.Errorf("action %d stored as %s, want %s", i, stored.Status, w.status)
+		}
+		if state := getItem(t, e, action.ItemID).State(); state != w.state {
+			t.Errorf("item %d state = %s, want %s", i, state, w.state)
+		}
+	}
+}
+
+// renewalCountingStore counts runner lease acquisitions, and refuses them once refuseAfter
+// (when set) have been granted.
+type renewalCountingStore struct {
+	*fakeScheduleStore
+	mu          sync.Mutex
+	acquired    int
+	refuseAfter int
+}
+
+func (s *renewalCountingStore) AcquireScheduleRunner(ctx context.Context, holder string, until time.Time) (bool, error) {
+	s.mu.Lock()
+	s.acquired++
+	refuse := s.refuseAfter > 0 && s.acquired > s.refuseAfter
+	s.mu.Unlock()
+	if refuse {
+		return false, nil
+	}
+	return s.fakeScheduleStore.AcquireScheduleRunner(ctx, holder, until)
+}
+
+func (s *renewalCountingStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acquired
+}
+
+func shortenLeaseRenewal(t *testing.T) {
+	t.Helper()
+	previous := leaseRenewal
+	leaseRenewal = time.Millisecond
+	t.Cleanup(func() { leaseRenewal = previous })
+}
+
+func TestRunDueActionsHoldsTheLeaseWhileAnActionRuns(t *testing.T) {
+	shortenLeaseRenewal(t)
+	store := &renewalCountingStore{fakeScheduleStore: newFakeScheduleStore()}
+	e := newScheduleEngine(store, nil)
+	seedPublishable(t, e, "k1", "o1")
+	base := scheduleBase()
+	action := mustSchedule(t, e, "k1", ActionPublish, base)
+	e.execute = func(ctx context.Context, _ ScheduledAction, builtin func(context.Context) error) error {
+		start := store.count()
+		deadline := time.Now().Add(5 * time.Second)
+		for store.count() < start+3 {
+			if time.Now().After(deadline) {
+				return errors.New("the lease was not renewed while the action ran")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return builtin(ctx)
+	}
+
+	run := mustRun(t, e, base)
+	if len(run.Actions) != 1 || run.Actions[0].Status != ActionSucceeded {
+		t.Fatalf("run = %#v", run)
+	}
+	if got := store.action(t, action.ID); got.Status != ActionSucceeded {
+		t.Fatalf("stored action = %#v", got)
+	}
+}
+
+func TestRunDueActionsStopsAnActionWhenTheLeaseIsLost(t *testing.T) {
+	shortenLeaseRenewal(t)
+	// The run's own acquisition and its renewal before the action are granted.
+	store := &renewalCountingStore{fakeScheduleStore: newFakeScheduleStore(), refuseAfter: 2}
+	e := newScheduleEngine(store, nil)
+	seedPublishable(t, e, "k1", "o1")
+	base := scheduleBase()
+	action := mustSchedule(t, e, "k1", ActionPublish, base)
+	var cause error
+	e.execute = func(ctx context.Context, _ ScheduledAction, _ func(context.Context) error) error {
+		select {
+		case <-ctx.Done():
+			cause = context.Cause(ctx)
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return errors.New("the action was not stopped")
+		}
+	}
+
+	run, err := e.RunDueActions(context.Background(), base)
+	wantKind(t, err, KindConflict)
+	if !errors.Is(cause, errLeaseLost) {
+		t.Fatalf("action context ended with %v, want the lost lease", cause)
+	}
+	if run == nil || len(run.Actions) != 0 {
+		t.Fatalf("run = %#v", run)
+	}
+	// The outcome is left to the run that took over.
+	if got := store.action(t, action.ID); got.Status != ActionRunning {
+		t.Fatalf("action = %#v, want it still running", got)
 	}
 }

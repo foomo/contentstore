@@ -77,4 +77,7 @@ type Deps struct {
 	NewID   func() string
 	Notify  Notifier
 	Role    DeploymentRole
+	// ScheduleExecutor runs due scheduled actions in place of the built-in operations;
+	// nil runs them through Publish, Unpublish and Archive.
+	ScheduleExecutor ScheduleExecutor
 }

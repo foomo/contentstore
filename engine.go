@@ -43,6 +43,8 @@ type Engine struct {
 	// schedules is the store's scheduled-action capabilities; nil when it has none or they
 	// are disabled.
 	schedules ScheduleStore
+	// execute runs due scheduled actions in place of the built-in operations when set.
+	execute ScheduleExecutor
 }
 
 var _ ContentStore = (*Engine)(nil)
@@ -64,6 +66,7 @@ func New(d Deps) *Engine {
 		newID:   d.NewID,
 		notify:  d.Notify,
 		role:    role,
+		execute: d.ScheduleExecutor,
 	}
 	if schedules, ok := d.Store.(ScheduleStore); ok && schedules.SchedulesEnabled() {
 		engine.schedules = schedules
