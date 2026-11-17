@@ -41,6 +41,13 @@ const (
 // without WithSchedules.
 var errSchedulesDisabled = errors.New("contentstore: scheduled actions are not enabled (see WithSchedules)")
 
+// collectionVersions holds the published versions of items (see WithVersions).
+const collectionVersions = "content_versions"
+
+// errVersionsDisabled is returned by the version methods of a Persistor built without
+// WithVersions.
+var errVersionsDisabled = errors.New("contentstore: versions are not enabled (see WithVersions)")
+
 // Index names of the tag rankings (see WithTagIndexes).
 const (
 	indexDraftTagsRank     = "draft_tags_rank"
@@ -65,12 +72,20 @@ func WithSchedules() StoreOption {
 	return func(p *Persistor) { p.schedules = true }
 }
 
+// WithVersions enables version history (see ContentVersions): NewMongoStore creates the
+// versions collection and its index. Without it the store creates neither, and an Engine
+// over it rejects the version methods and publishes of types with a VersionPolicy.
+func WithVersions() StoreOption {
+	return func(p *Persistor) { p.versions = true }
+}
+
 // Persistor is the MongoDB-backed Store. It depends only on the mongo driver.
 type Persistor struct {
 	client     *mongo.Client
 	coll       *mongo.Collection
 	tagIndexes bool
 	schedules  bool
+	versions   bool
 	// tagHintMissing records that a ranking index was missing, so later rankings skip the
 	// hint instead of failing it first.
 	tagHintMissing atomic.Bool
@@ -83,6 +98,7 @@ var (
 	_ TreeStore     = (*Persistor)(nil)
 	_ TagStore      = (*Persistor)(nil)
 	_ ScheduleStore = (*Persistor)(nil)
+	_ VersionStore  = (*Persistor)(nil)
 )
 
 // NewMongoStore connects to MongoDB (database taken from the connection string) and
@@ -102,6 +118,12 @@ func NewMongoStore(ctx context.Context, mongoURL string, opts ...StoreOption) (*
 	}
 	if p.schedules {
 		if err := p.ensureScheduleIndexes(ctx); err != nil {
+			_ = client.Disconnect(context.Background())
+			return nil, err
+		}
+	}
+	if p.versions {
+		if err := p.ensureVersionIndexes(ctx); err != nil {
 			_ = client.Disconnect(context.Background())
 			return nil, err
 		}
@@ -1036,6 +1058,145 @@ func (p *Persistor) ReleaseScheduleRunner(ctx context.Context, holder string) er
 	coll := p.coll.Database().Collection(collectionScheduleRunner)
 	if _, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: scheduleRunnerID}, {Key: "holder", Value: holder}}); err != nil {
 		return fmt.Errorf("contentstore: release schedule runner: %w", err)
+	}
+	return nil
+}
+
+// VersionsEnabled reports whether the Persistor was built with WithVersions.
+func (p *Persistor) VersionsEnabled() bool { return p.versions }
+
+// versionCollection returns the versions collection, or errVersionsDisabled.
+func (p *Persistor) versionCollection() (*mongo.Collection, error) {
+	if !p.versions {
+		return nil, errVersionsDisabled
+	}
+	return p.coll.Database().Collection(collectionVersions), nil
+}
+
+// ensureVersionIndexes creates the versions index: one version per item and revision, which
+// also serves an item's versions newest first and their pruning.
+func (p *Persistor) ensureVersionIndexes(ctx context.Context) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	_, err = coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "itemId", Value: 1}, {Key: "revision", Value: -1}},
+		Options: options.Index().SetName("item_revision_unique").SetUnique(true),
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure version indexes: %w", err)
+	}
+	return nil
+}
+
+// InsertVersion stores v unless its item already has a version of its revision. It looks
+// before it inserts: inside a transaction a duplicate key would abort the transaction, and
+// tree transactions are serialized, so the look cannot be overtaken there. Outside one, a
+// concurrent insert of the same version loses on the unique index, which is ignored.
+func (p *Persistor) InsertVersion(ctx context.Context, v *ContentVersion) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{{Key: "itemId", Value: v.ItemID}, {Key: "revision", Value: v.Revision}}
+	err = coll.FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return fmt.Errorf("contentstore: find version: %w", err)
+	}
+	if _, err := coll.InsertOne(ctx, v); err != nil && !mongo.IsDuplicateKeyError(err) {
+		return fmt.Errorf("contentstore: insert version: %w", err)
+	}
+	return nil
+}
+
+// GetVersion returns item itemID's version of the given revision, or ErrNotFound.
+func (p *Persistor) GetVersion(ctx context.Context, itemID string, revision int64) (*ContentVersion, error) {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return nil, err
+	}
+	v := &ContentVersion{}
+	err = coll.FindOne(ctx, bson.D{{Key: "itemId", Value: itemID}, {Key: "revision", Value: revision}}).Decode(v)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: get version: %w", err)
+	}
+	return v, nil
+}
+
+// FindVersions returns the versions matching q, newest first, without their snapshots.
+func (p *Persistor) FindVersions(ctx context.Context, q VersionQuery) ([]*ContentVersion, error) {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return nil, err
+	}
+	filter := bson.D{{Key: "itemId", Value: q.ItemID}}
+	if q.Before > 0 {
+		filter = append(filter, bson.E{Key: "revision", Value: bson.D{{Key: "$lt", Value: q.Before}}})
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "revision", Value: -1}}).
+		SetProjection(bson.D{{Key: "snapshot", Value: 0}})
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	cur, err := coll.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find versions: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var versions []*ContentVersion
+	if err := cur.All(ctx, &versions); err != nil {
+		return nil, fmt.Errorf("contentstore: find versions decode: %w", err)
+	}
+	return versions, nil
+}
+
+// PruneVersions deletes item itemID's versions older than its newest keep.
+func (p *Persistor) PruneVersions(ctx context.Context, itemID string, keep int) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	var newestPruned struct {
+		Revision int64 `bson:"revision"`
+	}
+	err = coll.FindOne(ctx, bson.D{{Key: "itemId", Value: itemID}}, options.FindOne().
+		SetSort(bson.D{{Key: "revision", Value: -1}}).
+		SetSkip(int64(keep)).
+		SetProjection(bson.D{{Key: "revision", Value: 1}})).Decode(&newestPruned)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("contentstore: find versions to prune: %w", err)
+	}
+	filter := bson.D{{Key: "itemId", Value: itemID}, {Key: "revision", Value: bson.D{{Key: "$lte", Value: newestPruned.Revision}}}}
+	if _, err := coll.DeleteMany(ctx, filter); err != nil {
+		return fmt.Errorf("contentstore: prune versions: %w", err)
+	}
+	return nil
+}
+
+// DeleteVersions deletes item itemID's versions, or every version when itemID is empty.
+func (p *Persistor) DeleteVersions(ctx context.Context, itemID string) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{}
+	if itemID != "" {
+		filter = bson.D{{Key: "itemId", Value: itemID}}
+	}
+	if _, err := coll.DeleteMany(ctx, filter); err != nil {
+		return fmt.Errorf("contentstore: delete versions: %w", err)
 	}
 	return nil
 }

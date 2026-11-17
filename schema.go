@@ -69,6 +69,28 @@ type ContentTypeSchema struct {
 	// Tags enables tags on items of this type (nil: they cannot be tagged). Like
 	// ChildTypes it is a policy and not part of the hash.
 	Tags *TagPolicy `json:"tags,omitempty"`
+
+	// Versions keeps the published history of items of this type (nil: none is kept; see
+	// ContentVersions). Like Tags it is a policy and not part of the hash.
+	Versions *VersionPolicy `json:"versions,omitempty"`
+}
+
+// DefaultKeepVersions is how many versions an item keeps under a VersionPolicy that sets no
+// Keep.
+const DefaultKeepVersions = 100
+
+// VersionPolicy records every publish of a type's items as a version (see ContentVersions).
+type VersionPolicy struct {
+	// Keep is how many versions each item keeps, the newest ones; 0 means
+	// DefaultKeepVersions.
+	Keep int `json:"keep,omitempty"`
+}
+
+func (p *VersionPolicy) keep() int {
+	if p.Keep == 0 {
+		return DefaultKeepVersions
+	}
+	return p.Keep
 }
 
 // FieldDefinition describes one field. ReadOnly marks system-generated fields editors
@@ -119,6 +141,9 @@ func (r *Registry) Register(s ContentTypeSchema) {
 		if err := s.Tags.validate(); err != nil {
 			panic(fmt.Sprintf("contentstore: schema %q tags: %v", s.Type, err))
 		}
+	}
+	if s.Versions != nil && s.Versions.Keep < 0 {
+		panic(fmt.Sprintf("contentstore: schema %q versions: keep must not be negative", s.Type))
 	}
 	if s.Hash == "" {
 		s.Hash = schemaHash(s)

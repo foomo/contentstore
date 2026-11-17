@@ -28,8 +28,8 @@ func (e *Engine) ExportContent(ctx context.Context) (*ContentExport, error) {
 }
 
 // ReplaceContent atomically replaces all data on a sandbox instance and clears its pending
-// scheduled actions. Canonical instances reject the operation before inspecting or writing
-// the payload.
+// scheduled actions and its versions. Canonical instances reject the operation before
+// inspecting or writing the payload.
 func (e *Engine) ReplaceContent(ctx context.Context, export ContentExport) (*ReplaceContentResult, error) {
 	if e.role != DeploymentRoleSandbox {
 		return nil, forbidden("content replacement is allowed only on a sandbox deployment")
@@ -43,6 +43,12 @@ func (e *Engine) ReplaceContent(ctx context.Context, export ContentExport) (*Rep
 		unfinished := ScheduledActionQuery{Statuses: []ScheduledActionStatus{ActionPending, ActionRunning}}
 		if _, err := e.schedules.DeleteScheduledActions(ctx, unfinished); err != nil {
 			return nil, internalErr(err, "clearing scheduled actions failed")
+		}
+	}
+	// Versions describe the content being replaced, and exports do not carry them.
+	if e.versions != nil {
+		if err := e.versions.DeleteVersions(ctx, ""); err != nil {
+			return nil, internalErr(err, "clearing versions failed")
 		}
 	}
 	if err := e.store.ReplaceAll(ctx, export.Items); err != nil {

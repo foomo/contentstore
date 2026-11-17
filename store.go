@@ -209,3 +209,34 @@ type ScheduleCursor struct {
 	At time.Time `json:"at"`
 	ID string    `json:"id"`
 }
+
+// VersionStore is the optional persistence contract for version history. *Persistor
+// implements it and enables it with WithVersions; an Engine over a store without it, or with
+// it disabled, rejects the ContentVersions methods and publishes of types with a
+// VersionPolicy, so existing Store implementations keep working unchanged.
+type VersionStore interface {
+	Store
+	// VersionsEnabled reports whether the store keeps versions.
+	VersionsEnabled() bool
+	// InsertVersion stores v, unless item v.ItemID already has a version of v.Revision,
+	// which it keeps unchanged. Inside a tree transaction it must not fail the transaction
+	// on an existing version.
+	InsertVersion(ctx context.Context, v *ContentVersion) error
+	// GetVersion returns item itemID's version of the given revision, or ErrNotFound.
+	GetVersion(ctx context.Context, itemID string, revision int64) (*ContentVersion, error)
+	// FindVersions returns the versions matching q, newest first, without their snapshots.
+	FindVersions(ctx context.Context, q VersionQuery) ([]*ContentVersion, error)
+	// PruneVersions deletes item itemID's versions except the newest keep.
+	PruneVersions(ctx context.Context, itemID string, keep int) error
+	// DeleteVersions deletes item itemID's versions, or every version when itemID is empty.
+	DeleteVersions(ctx context.Context, itemID string) error
+}
+
+// VersionQuery selects one page of an item's versions.
+type VersionQuery struct {
+	ItemID string
+	// Before continues with the versions older than this revision (from the newest when 0).
+	Before int64
+	// Limit caps the number of versions (unlimited when zero).
+	Limit int
+}

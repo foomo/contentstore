@@ -45,6 +45,10 @@ type Engine struct {
 	schedules ScheduleStore
 	// execute runs due scheduled actions in place of the built-in operations when set.
 	execute ScheduleExecutor
+
+	// versions is the store's version capabilities; nil when it has none or they are
+	// disabled.
+	versions VersionStore
 }
 
 var _ ContentStore = (*Engine)(nil)
@@ -70,6 +74,9 @@ func New(d Deps) *Engine {
 	}
 	if schedules, ok := d.Store.(ScheduleStore); ok && schedules.SchedulesEnabled() {
 		engine.schedules = schedules
+	}
+	if versions, ok := d.Store.(VersionStore); ok && versions.VersionsEnabled() {
+		engine.versions = versions
 	}
 	return engine
 }
@@ -276,13 +283,29 @@ func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (
 	return input.Type, nil, nil
 }
 
-// Publish copies the current draft snapshot into the published snapshot.
+// Publish copies the current draft snapshot into the published snapshot. For a type with a
+// VersionPolicy it records the published snapshot as a version (see ContentVersions), in
+// the same transaction for tree items. For other items it records it right after; if that
+// fails, the item is published (and emits OpPublish) but Publish returns the error, and
+// publishing again records the version.
 func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, _, err := e.write(ctx, match, "publish failed", e.publish)
-	if err != nil {
+	var replaced *ContentSnapshot // the published snapshot the publish replaces
+	item, _, err := e.writeThen(ctx, match, "publish failed", func(ctx context.Context, item *ContentItem) (bool, error) {
+		if err := e.requireVersionsFor(item.Type); err != nil {
+			return false, err
+		}
+		replaced = item.Published
+		return e.publish(ctx, item)
+	}, func(ctx context.Context, item *ContentItem) error {
+		return e.recordVersions(ctx, item, replaced)
+	})
+	if item == nil {
 		return nil, err
 	}
 	e.emit(item, OpPublish)
+	if err != nil {
+		return nil, err
+	}
 	return item, nil
 }
 
@@ -405,9 +428,9 @@ func (e *Engine) Unarchive(ctx context.Context, match ContentItemMatch) (*Conten
 	return item, nil
 }
 
-// Delete hard-deletes an item and its scheduled actions. Deleting a missing item is
-// idempotent (returns false). A tree item can only be deleted once it has no children,
-// archived ones included.
+// Delete hard-deletes an item, its scheduled actions and its versions. Deleting a missing
+// item is idempotent (returns false). A tree item can only be deleted once it has no
+// children, archived ones included.
 func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, error) {
 	if match.ID == "" && match.Key == "" {
 		return false, badRequest("delete requires a non-empty match (id or key)")
@@ -423,6 +446,7 @@ func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, erro
 		deleted, err := e.deleteTreeItem(ctx, match)
 		if deleted {
 			e.dropScheduledActions(ctx, item.ID)
+			e.dropVersions(ctx, item.ID)
 		}
 		return deleted, err
 	}
@@ -430,6 +454,7 @@ func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, erro
 		return false, internalErr(err, "delete failed")
 	}
 	e.dropScheduledActions(ctx, item.ID)
+	e.dropVersions(ctx, item.ID)
 	e.emit(item, OpDelete)
 	return true, nil
 }

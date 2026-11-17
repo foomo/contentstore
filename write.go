@@ -22,6 +22,14 @@ type mutation func(ctx context.Context, item *ContentItem) (bool, error)
 //
 // failure is the message of an unexpected store error.
 func (e *Engine) write(ctx context.Context, match ContentItemMatch, failure string, mutate mutation) (*ContentItem, bool, error) {
+	return e.writeThen(ctx, match, failure, mutate, nil)
+}
+
+// writeThen is write followed by then (when set), which runs once the changed item is
+// written: inside the tree transaction for tree items, so it commits or fails together with
+// the write, and right after the write for every other item. For those, an error of then is
+// returned together with the written item; every other error comes with a nil item.
+func (e *Engine) writeThen(ctx context.Context, match ContentItemMatch, failure string, mutate mutation, then func(ctx context.Context, item *ContentItem) error) (*ContentItem, bool, error) {
 	item, err := e.loadByMatch(ctx, match)
 	if err != nil {
 		return nil, false, err
@@ -37,6 +45,9 @@ func (e *Engine) write(ctx context.Context, match ContentItemMatch, failure stri
 			if err := e.store.Upsert(ctx, item, nil); err != nil {
 				return internalErr(err, failure)
 			}
+			if then != nil {
+				return then(ctx, item)
+			}
 			return nil
 		})
 		if err != nil {
@@ -44,7 +55,11 @@ func (e *Engine) write(ctx context.Context, match ContentItemMatch, failure stri
 		}
 		return item, changed, nil
 	case e.tagged(item):
-		return e.casWrite(ctx, match, item, failure, mutate)
+		item, changed, err := e.casWrite(ctx, match, item, failure, mutate)
+		if err != nil || !changed || then == nil {
+			return item, changed, err
+		}
+		return item, true, then(ctx, item)
 	}
 	changed, err := mutate(ctx, item)
 	if err != nil {
@@ -53,6 +68,9 @@ func (e *Engine) write(ctx context.Context, match ContentItemMatch, failure stri
 	if changed {
 		if err := e.store.Upsert(ctx, item, nil); err != nil {
 			return nil, false, internalErr(err, failure)
+		}
+		if then != nil {
+			return item, true, then(ctx, item)
 		}
 	}
 	return item, changed, nil

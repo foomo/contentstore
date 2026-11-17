@@ -434,3 +434,92 @@ type ScheduleRun struct {
 	Busy    bool              `json:"busy,omitempty"`
 	Actions []ScheduledAction `json:"actions"`
 }
+
+// ContentVersion is one published state of an item, recorded when it was published (see
+// ContentVersions). A revision always holds the same content, so the draft revision that
+// was published identifies the version. Versions are immutable: PublishedAt and PublishedBy
+// tell when, and by whom, the revision was first published.
+type ContentVersion struct {
+	ItemID      string    `json:"itemId" bson:"itemId"`
+	Revision    int64     `json:"revision" bson:"revision"`
+	PublishedAt time.Time `json:"publishedAt" bson:"publishedAt"`
+	// PublishedBy is the author of the publishing context (see WithAuthor); empty when it
+	// had none.
+	PublishedBy string `json:"publishedBy,omitempty" bson:"publishedBy,omitempty"`
+	// Snapshot is the published snapshot. ListVersions leaves it out.
+	Snapshot *ContentSnapshot `json:"snapshot,omitempty" bson:"snapshot,omitempty"`
+}
+
+// ListVersionsInput lists the versions of the matched item, newest first. Limit defaults to
+// 100 and may be at most 1000; Cursor continues from a previous page's NextCursor.
+type ListVersionsInput struct {
+	Match  ContentItemMatch `json:"match"`
+	Limit  int              `json:"limit,omitempty"`
+	Cursor string           `json:"cursor,omitempty"`
+}
+
+// VersionPage is one page of ListVersions, without the versions' snapshots. NextCursor is
+// empty on the last page.
+type VersionPage struct {
+	Items      []ContentVersion `json:"items"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+// CompareVersionsInput compares two revisions of the matched item. Each is a recorded
+// version, the item's published or draft revision, or 0 for the current draft.
+type CompareVersionsInput struct {
+	Match ContentItemMatch `json:"match"`
+	From  int64            `json:"from"`
+	To    int64            `json:"to"`
+}
+
+// VersionDiff lists the field values and tags that differ between two revisions of an
+// item, ordered by field ID and locale, and by tag ID. From and To are the compared
+// revisions (To is the draft revision when 0 was asked for).
+type VersionDiff struct {
+	From   int64         `json:"from"`
+	To     int64         `json:"to"`
+	Fields []FieldChange `json:"fields"`
+	Tags   []TagChange   `json:"tags"`
+}
+
+// FieldChange is a field locale whose value differs. From is nil when the value was added,
+// To is nil when it was removed.
+type FieldChange struct {
+	FieldID string     `json:"fieldId"`
+	Locale  string     `json:"locale"`
+	From    FieldValue `json:"from,omitempty"`
+	To      FieldValue `json:"to,omitempty"`
+}
+
+// TagChange is a tag that differs. From is nil when the tag was added, To is nil when it
+// was removed; both are set when its weight changed.
+type TagChange struct {
+	ID   string   `json:"id"`
+	From *float64 `json:"from,omitempty"`
+	To   *float64 `json:"to,omitempty"`
+}
+
+// RestoreVersionInput restores revision Revision of the matched item (a recorded version or
+// its published revision) as its draft. ExpectedRevision is optional: a positive value
+// restores only over that draft revision.
+type RestoreVersionInput struct {
+	Match            ContentItemMatch `json:"match"`
+	Revision         int64            `json:"revision"`
+	ExpectedRevision *int64           `json:"expectedRevision,omitempty"`
+}
+
+// RestoreVersionResult is the item with its restored draft. DroppedFields and DroppedTags
+// are what the version holds that the type's current schema or tag policy no longer
+// accepts, so the restored draft leaves them out.
+type RestoreVersionResult struct {
+	Item          *ContentItem  `json:"item"`
+	DroppedFields []FieldLocale `json:"droppedFields,omitempty"`
+	DroppedTags   []string      `json:"droppedTags,omitempty"`
+}
+
+// FieldLocale identifies one locale of a field.
+type FieldLocale struct {
+	FieldID string `json:"fieldId"`
+	Locale  string `json:"locale"`
+}

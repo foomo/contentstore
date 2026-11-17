@@ -12,6 +12,7 @@ It provides:
 - opt-in content trees (folders) with path lookups and paginated child listings;
 - opt-in weighted tags with filters, index-backed rankings, tag counts and tag merges;
 - opt-in scheduled publish, unpublish and archive actions;
+- opt-in version history of published content, with diffs and restore;
 - a MongoDB-backed store and an injectable persistence interface;
 - checksummed export and atomic replacement operations.
 
@@ -147,6 +148,52 @@ Without the option nothing is created in MongoDB, and the scheduling methods (on
 
 Actions are stored in `content_scheduled_actions` and the lease in `content_schedule_runner`.
 Scheduling needs no replica set, though actions on tree items still do, like any tree write.
+
+## Version history
+
+A schema keeps the published history of its items by declaring a version policy, and the store
+must keep versions:
+
+```go
+article.Versions = &contentstore.VersionPolicy{Keep: 50} // 0 means 100
+
+store, err := contentstore.NewMongoStore(ctx, url, contentstore.WithVersions())
+```
+
+Without the option nothing is created in MongoDB, and the version methods (on `ContentVersions`)
+fail. So does publishing a type with a policy, so that no publish goes unrecorded.
+
+- **Recording.** Every `Publish` records the published snapshot (fields and tags) as a version.
+  - A revision always holds the same content, so the published draft revision identifies the
+    version. Publishing the same revision again records nothing new: a version is immutable and
+    tells when, and by whom, its revision was first published.
+  - The author comes from the context: `contentstore.WithAuthor(ctx, userID)`. Scheduled publishes
+    take the author of the context given to `RunDueActions`.
+  - A publish also records the published snapshot it replaces, if that was never recorded. That
+    covers items published before their type kept versions, and published tags rewritten by
+    `MergeTags` or `DeleteTag`, which don't publish.
+  - Tree items record the version in the publish's transaction. Other items record it right
+    after: if that fails, the item is published but `Publish` returns the error, and publishing
+    again records the version.
+  - Each item keeps its newest `Keep` versions; a publish prunes the older ones.
+  - Not versioned: placement (moves and renames), unpublishing and archiving.
+- **Reading.** `ListVersions` pages through an item's versions, newest first, without their
+  content; `GetVersion` returns one with its snapshot.
+- **Comparing.** `CompareVersions` lists the field locales and tags that differ between two
+  revisions, with both values, so the application can render a text diff. A revision is a
+  recorded version, the item's published or draft revision, or 0 for the current draft.
+- **Restoring.** `RestoreVersion` writes a version (or the published revision) back as the item's
+  draft: a new draft revision, which isn't published until the application publishes it.
+  - It takes an optional expected draft revision, emits `OpSaveDraft`, and leaves placement alone.
+  - Field values and tags the current schema or tag policy no longer accepts are left out and
+    reported in the result. Other values it rejects, e.g. a value over a lowered size limit, fail
+    the restore.
+  - Revisions never go back: restoring the published revision gives the published content as a
+    new draft revision, so the item is `changed` until it is published again.
+- **Cascades.** Deleting an item deletes its versions; archiving keeps them. `ReplaceContent`
+  clears all versions, and versions aren't part of `ExportContent`.
+
+Versions are stored in `content_versions`, one document per item and revision.
 
 ## Field size limits
 
