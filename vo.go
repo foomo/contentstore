@@ -59,17 +59,25 @@ type ContentSnapshot struct {
 	SchemaVersion string        `json:"schemaVersion" bson:"schemaVersion"`
 	SchemaHash    string        `json:"schemaHash" bson:"schemaHash"`
 	Fields        ContentFields `json:"fields" bson:"fields"`
+	Tags          TagSet        `json:"tags,omitempty" bson:"tags,omitempty"`
 	CreatedAt     time.Time     `json:"createdAt" bson:"createdAt"`
 	UpdatedAt     time.Time     `json:"updatedAt" bson:"updatedAt"`
 }
 
 // ContentItem is one stored content piece, persisted as a single MongoDB document
 // (ID is the Mongo _id). Draft and Published snapshots live in the same document.
+//
+// ParentID and Name place an item of a tree type in its content tree (see
+// ContentTypeSchema.ChildTypes). Like Key and OwnerRef they are structural and not
+// versioned: a move or rename applies to the draft and published views at once. An empty
+// ParentID with a Name means root level; items of other types carry neither.
 type ContentItem struct {
 	ID         string           `json:"id" bson:"_id"`
 	Key        string           `json:"key,omitempty" bson:"key,omitempty"`
 	Type       ContentType      `json:"type" bson:"type"`
 	OwnerRef   *OwnerRef        `json:"ownerRef,omitempty" bson:"ownerRef,omitempty"`
+	ParentID   string           `json:"parentId,omitempty" bson:"parentId,omitempty"`
+	Name       string           `json:"name,omitempty" bson:"name,omitempty"`
 	Draft      *ContentSnapshot `json:"draft,omitempty" bson:"draft,omitempty"`
 	Published  *ContentSnapshot `json:"published,omitempty" bson:"published,omitempty"`
 	ArchivedAt *time.Time       `json:"archivedAt,omitempty" bson:"archivedAt,omitempty"`
@@ -117,12 +125,26 @@ type ContentItemMatch struct {
 // SaveDraftInput is the request for SaveDraft. Type is required only when creating.
 // ExpectedRevision is optional: nil preserves unconditional save behavior, zero creates
 // only when no item exists, and a positive value updates only that draft revision.
+//
+// ParentID and Name place a new item of a tree type (Name is required for those; an empty
+// ParentID means root level). On update they may be omitted or must match the current
+// placement: use Move to change it.
 type SaveDraftInput struct {
 	Match            ContentItemMatch `json:"match"`
 	Type             ContentType      `json:"type,omitempty"`
 	OwnerRef         *OwnerRef        `json:"ownerRef,omitempty"`
+	ParentID         string           `json:"parentId,omitempty"`
+	Name             string           `json:"name,omitempty"`
 	Fields           ContentFields    `json:"fields"`
 	ExpectedRevision *int64           `json:"expectedRevision,omitempty"`
+}
+
+// MoveInput moves and/or renames a tree item. A nil ParentID keeps the current parent and
+// a pointer to "" moves the item to root level; an empty Name keeps the current name.
+type MoveInput struct {
+	Match    ContentItemMatch `json:"match"`
+	ParentID *string          `json:"parentId,omitempty"`
+	Name     string           `json:"name,omitempty"`
 }
 
 // SetFieldValueInput sets a single field's value for one locale, merging into the item's
@@ -138,10 +160,19 @@ type SetFieldValueInput struct {
 }
 
 // SnapshotInput narrows a consumer snapshot by content type and, optionally,
-// exact owner. Empty filters return every item visible in the configured view.
+// exact owner and tags. Empty filters return every item visible in the configured view.
 type SnapshotInput struct {
 	Types    []ContentType `json:"types,omitempty"`
 	OwnerRef *OwnerRef     `json:"ownerRef,omitempty"`
+	Tags     *TagFilter    `json:"tags,omitempty"`
+}
+
+// TagFilter selects items by the tags of the read view: every tag in All, at least one
+// tag in Any (when set) and no tag in None.
+type TagFilter struct {
+	All  []string `json:"all,omitempty"`
+	Any  []string `json:"any,omitempty"`
+	None []string `json:"none,omitempty"`
 }
 
 // Snapshot is the common bulk-read shape for published and preview consumers.
@@ -163,8 +194,11 @@ type SnapshotItem struct {
 	Key       string        `json:"key,omitempty"`
 	Type      ContentType   `json:"type"`
 	OwnerRef  *OwnerRef     `json:"ownerRef,omitempty"`
+	ParentID  string        `json:"parentId,omitempty"`
+	Name      string        `json:"name,omitempty"`
 	State     string        `json:"state"`
 	Fields    ContentFields `json:"fields"`
+	Tags      TagSet        `json:"tags,omitempty"`
 	UpdatedAt time.Time     `json:"updatedAt"`
 }
 
@@ -191,12 +225,301 @@ type ArchivedContentItem struct {
 	Key        string        `json:"key,omitempty"`
 	Type       ContentType   `json:"type"`
 	OwnerRef   *OwnerRef     `json:"ownerRef,omitempty"`
+	ParentID   string        `json:"parentId,omitempty"`
+	Name       string        `json:"name,omitempty"`
 	Fields     ContentFields `json:"fields"`
+	Tags       TagSet        `json:"tags,omitempty"`
 	ArchivedAt time.Time     `json:"archivedAt"`
 	UpdatedAt  time.Time     `json:"updatedAt"`
+}
+
+// UpdateTagsInput changes an item's draft tags (MergeTags and DeleteTag are the other tag
+// writes). Set adds tags
+// or changes their weights (a nil weight is 1); Remove drops tags; with Replace, Set
+// becomes the complete set (and Remove must be empty), so an empty Set clears all tags.
+type UpdateTagsInput struct {
+	Match   ContentItemMatch    `json:"match"`
+	Set     map[string]*float64 `json:"set,omitempty"`
+	Remove  []string            `json:"remove,omitempty"`
+	Replace bool                `json:"replace,omitempty"`
+}
+
+// MergeTagsInput merges tag From into tag To on the live items of Types (every type that
+// takes tags when empty), in both their draft and published snapshots. From may be any
+// stored tag; To must be allowed by each item's tag policy.
+type MergeTagsInput struct {
+	From  string        `json:"from"`
+	To    string        `json:"to"`
+	Types []ContentType `json:"types,omitempty"`
+}
+
+// MergeTagsResult reports a tag merge: how many items changed, and the items that could
+// not be merged, which keep tag From.
+type MergeTagsResult struct {
+	Merged int               `json:"merged"`
+	Failed []TagWriteFailure `json:"failed,omitempty"`
+}
+
+// DeleteTagInput deletes tag Tag from the live items of Types (every type that takes tags
+// when empty), from both their draft and published snapshots. Tag may be any stored tag.
+type DeleteTagInput struct {
+	Tag   string        `json:"tag"`
+	Types []ContentType `json:"types,omitempty"`
+}
+
+// DeleteTagResult reports a tag deletion: how many items changed, and the items that could
+// not be changed, which keep the tag.
+type DeleteTagResult struct {
+	Deleted int               `json:"deleted"`
+	Failed  []TagWriteFailure `json:"failed,omitempty"`
+}
+
+// TagWriteFailure is an item a tag merge or deletion could not change, and why.
+type TagWriteFailure struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
+}
+
+// ListChildrenInput lists the children of ParentID (named root-level items when empty),
+// ordered by name. Types narrows them by content type and Fields projects their field
+// sets (all fields when empty). Limit defaults to 100 and may be at most 1000; Cursor
+// continues from a previous page's NextCursor.
+type ListChildrenInput struct {
+	ParentID string        `json:"parentId,omitempty"`
+	Types    []ContentType `json:"types,omitempty"`
+	Tags     *TagFilter    `json:"tags,omitempty"`
+	Fields   []FieldID     `json:"fields,omitempty"`
+	Limit    int           `json:"limit,omitempty"`
+	Cursor   string        `json:"cursor,omitempty"`
+}
+
+// ItemPage is one page of ListChildren or ListTagged. NextCursor is empty on the last page.
+type ItemPage struct {
+	Items      []SnapshotItem `json:"items"`
+	NextCursor string         `json:"nextCursor,omitempty"`
+}
+
+// ListTaggedInput ranks the items carrying Tag by its weight, highest first (ties by
+// descending ID). Types and Filter narrow the items, Fields projects their field sets (all
+// fields when empty). Limit defaults to 100 and may be at most 1000; Cursor continues from
+// a previous page's NextCursor. A page can come back short, with a NextCursor, when many
+// ranked items are hidden by Filter or by unpublished ancestors.
+type ListTaggedInput struct {
+	Tag    string        `json:"tag"`
+	Types  []ContentType `json:"types,omitempty"`
+	Filter *TagFilter    `json:"filter,omitempty"`
+	Fields []FieldID     `json:"fields,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+	Cursor string        `json:"cursor,omitempty"`
+}
+
+// TagCountsInput counts the tags of the items visible in a view, for facets and
+// autocomplete. Types defaults to every type that takes tags; Prefix narrows the tags
+// (e.g. "topic:da"); Limit defaults to 20 and may be at most 1000.
+type TagCountsInput struct {
+	Types  []ContentType `json:"types,omitempty"`
+	Prefix string        `json:"prefix,omitempty"`
+	Limit  int           `json:"limit,omitempty"`
+}
+
+// TagCounts lists tags by how many items carry them, most used first (ties by ID).
+type TagCounts struct {
+	Items []TagCount `json:"items"`
+}
+
+// TagCount is the number of items carrying one tag.
+type TagCount struct {
+	ID    string `json:"id"`
+	Count int    `json:"count"`
+}
+
+// TreeItemInput addresses one item either by Match or by Path ("/kb/tables/users", the
+// names from the root level down; the leading slash is optional). Fields projects its
+// field set (all fields when empty).
+type TreeItemInput struct {
+	Match  ContentItemMatch `json:"match"`
+	Path   string           `json:"path,omitempty"`
+	Fields []FieldID        `json:"fields,omitempty"`
+}
+
+// TreeItem is one item in a snapshot view with its ancestors (root first) and its path.
+// Items outside the tree have no ancestors and an empty path.
+type TreeItem struct {
+	Item      SnapshotItem `json:"item"`
+	Ancestors []TreeRef    `json:"ancestors"`
+	Path      string       `json:"path,omitempty"`
+}
+
+// TreeRef identifies an ancestor in a TreeItem.
+type TreeRef struct {
+	ID   string      `json:"id"`
+	Type ContentType `json:"type"`
+	Name string      `json:"name"`
 }
 
 // SchemasResult exposes the registered content schemas.
 type SchemasResult struct {
 	Schemas []ContentTypeSchema `json:"schemas"`
+}
+
+// ScheduledActionType is what a scheduled action does to its item when it runs.
+type ScheduledActionType string
+
+const (
+	ActionPublish   ScheduledActionType = "publish"
+	ActionUnpublish ScheduledActionType = "unpublish"
+	ActionArchive   ScheduledActionType = "archive"
+)
+
+// ScheduledActionStatus is the lifecycle of a scheduled action: pending until a runner
+// claims it, running while it executes, then succeeded or failed.
+type ScheduledActionStatus string
+
+const (
+	ActionPending   ScheduledActionStatus = "pending"
+	ActionRunning   ScheduledActionStatus = "running"
+	ActionSucceeded ScheduledActionStatus = "succeeded"
+	ActionFailed    ScheduledActionStatus = "failed"
+)
+
+// ScheduledAction publishes, unpublishes or archives one item at a given minute (see
+// ContentSchedules). It is stored apart from the item and is not content: creating or
+// running it does not change the item's draft revision. Error holds why the action failed,
+// or why its last attempt could not run while it is pending again.
+type ScheduledAction struct {
+	ID         string                `json:"id" bson:"_id"`
+	ItemID     string                `json:"itemId" bson:"itemId"`
+	ItemType   ContentType           `json:"itemType" bson:"itemType"`
+	Action     ScheduledActionType   `json:"action" bson:"action"`
+	At         time.Time             `json:"at" bson:"at"`
+	Status     ScheduledActionStatus `json:"status" bson:"status"`
+	Error      string                `json:"error,omitempty" bson:"error,omitempty"`
+	CreatedAt  time.Time             `json:"createdAt" bson:"createdAt"`
+	UpdatedAt  time.Time             `json:"updatedAt" bson:"updatedAt"`
+	ExecutedAt *time.Time            `json:"executedAt,omitempty" bson:"executedAt,omitempty"`
+}
+
+// ScheduleActionInput schedules Action on the matched item at At, which is truncated to
+// the minute and must lie in the future.
+type ScheduleActionInput struct {
+	Match  ContentItemMatch    `json:"match"`
+	Action ScheduledActionType `json:"action"`
+	At     time.Time           `json:"at"`
+}
+
+// ListScheduledActionsInput lists scheduled actions ordered by time (ties by ID): those of
+// the matched item (all items when Match is empty) in the given statuses (all when empty),
+// from From (inclusive) to To (exclusive). Limit defaults to 100 and may be at most 1000;
+// Cursor continues from a previous page's NextCursor.
+type ListScheduledActionsInput struct {
+	Match    ContentItemMatch        `json:"match"`
+	Statuses []ScheduledActionStatus `json:"statuses,omitempty"`
+	From     *time.Time              `json:"from,omitempty"`
+	To       *time.Time              `json:"to,omitempty"`
+	Limit    int                     `json:"limit,omitempty"`
+	Cursor   string                  `json:"cursor,omitempty"`
+}
+
+// ScheduledActionPage is one page of ListScheduledActions. NextCursor is empty on the last
+// page.
+type ScheduledActionPage struct {
+	Items      []ScheduledAction `json:"items"`
+	NextCursor string            `json:"nextCursor,omitempty"`
+}
+
+// ScheduleRun reports one RunDueActions call. Busy means another runner held the lease and
+// nothing ran. Actions are the actions this run processed, in order, with their resulting
+// status: succeeded, failed, or pending again after an internal error.
+type ScheduleRun struct {
+	Busy    bool              `json:"busy,omitempty"`
+	Actions []ScheduledAction `json:"actions"`
+}
+
+// ContentVersion is one published state of an item, recorded when it was published (see
+// ContentVersions). A revision always holds the same content, so the draft revision that
+// was published identifies the version. Versions are immutable: PublishedAt and PublishedBy
+// tell when, and by whom, the revision was first published.
+type ContentVersion struct {
+	ItemID      string    `json:"itemId" bson:"itemId"`
+	Revision    int64     `json:"revision" bson:"revision"`
+	PublishedAt time.Time `json:"publishedAt" bson:"publishedAt"`
+	// PublishedBy is the author of the publishing context (see WithAuthor); empty when it
+	// had none.
+	PublishedBy string `json:"publishedBy,omitempty" bson:"publishedBy,omitempty"`
+	// Snapshot is the published snapshot. ListVersions leaves it out.
+	Snapshot *ContentSnapshot `json:"snapshot,omitempty" bson:"snapshot,omitempty"`
+}
+
+// ListVersionsInput lists the versions of the matched item, newest first. Limit defaults to
+// 100 and may be at most 1000; Cursor continues from a previous page's NextCursor.
+type ListVersionsInput struct {
+	Match  ContentItemMatch `json:"match"`
+	Limit  int              `json:"limit,omitempty"`
+	Cursor string           `json:"cursor,omitempty"`
+}
+
+// VersionPage is one page of ListVersions, without the versions' snapshots. NextCursor is
+// empty on the last page.
+type VersionPage struct {
+	Items      []ContentVersion `json:"items"`
+	NextCursor string           `json:"nextCursor,omitempty"`
+}
+
+// CompareVersionsInput compares two revisions of the matched item. Each is a recorded
+// version, the item's published or draft revision, or 0 for the current draft.
+type CompareVersionsInput struct {
+	Match ContentItemMatch `json:"match"`
+	From  int64            `json:"from"`
+	To    int64            `json:"to"`
+}
+
+// VersionDiff lists the field values and tags that differ between two revisions of an
+// item, ordered by field ID and locale, and by tag ID. From and To are the compared
+// revisions (To is the draft revision when 0 was asked for).
+type VersionDiff struct {
+	From   int64         `json:"from"`
+	To     int64         `json:"to"`
+	Fields []FieldChange `json:"fields"`
+	Tags   []TagChange   `json:"tags"`
+}
+
+// FieldChange is a field locale whose value differs. From is nil when the value was added,
+// To is nil when it was removed.
+type FieldChange struct {
+	FieldID string     `json:"fieldId"`
+	Locale  string     `json:"locale"`
+	From    FieldValue `json:"from,omitempty"`
+	To      FieldValue `json:"to,omitempty"`
+}
+
+// TagChange is a tag that differs. From is nil when the tag was added, To is nil when it
+// was removed; both are set when its weight changed.
+type TagChange struct {
+	ID   string   `json:"id"`
+	From *float64 `json:"from,omitempty"`
+	To   *float64 `json:"to,omitempty"`
+}
+
+// RestoreVersionInput restores revision Revision of the matched item (a recorded version or
+// its published revision) as its draft. ExpectedRevision is optional: a positive value
+// restores only over that draft revision.
+type RestoreVersionInput struct {
+	Match            ContentItemMatch `json:"match"`
+	Revision         int64            `json:"revision"`
+	ExpectedRevision *int64           `json:"expectedRevision,omitempty"`
+}
+
+// RestoreVersionResult is the item with its restored draft. DroppedFields and DroppedTags
+// are what the version holds that the type's current schema or tag policy no longer
+// accepts, so the restored draft leaves them out.
+type RestoreVersionResult struct {
+	Item          *ContentItem  `json:"item"`
+	DroppedFields []FieldLocale `json:"droppedFields,omitempty"`
+	DroppedTags   []string      `json:"droppedTags,omitempty"`
+}
+
+// FieldLocale identifies one locale of a field.
+type FieldLocale struct {
+	FieldID string `json:"fieldId"`
+	Locale  string `json:"locale"`
 }

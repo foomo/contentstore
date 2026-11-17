@@ -27,14 +27,29 @@ func (e *Engine) ExportContent(ctx context.Context) (*ContentExport, error) {
 	return export, nil
 }
 
-// ReplaceContent atomically replaces all data on a sandbox instance. Canonical
-// instances reject the operation before inspecting or writing the payload.
+// ReplaceContent atomically replaces all data on a sandbox instance and clears its pending
+// scheduled actions and its versions. Canonical instances reject the operation before
+// inspecting or writing the payload.
 func (e *Engine) ReplaceContent(ctx context.Context, export ContentExport) (*ReplaceContentResult, error) {
 	if e.role != DeploymentRoleSandbox {
 		return nil, forbidden("content replacement is allowed only on a sandbox deployment")
 	}
 	if err := validateContentExport(export); err != nil {
 		return nil, badRequest(err.Error())
+	}
+	// Pending actions would run against the replaced content. Clearing them first means a
+	// failed replacement loses only this sandbox's schedules.
+	if e.schedules != nil {
+		unfinished := ScheduledActionQuery{Statuses: []ScheduledActionStatus{ActionPending, ActionRunning}}
+		if _, err := e.schedules.DeleteScheduledActions(ctx, unfinished); err != nil {
+			return nil, internalErr(err, "clearing scheduled actions failed")
+		}
+	}
+	// Versions describe the content being replaced, and exports do not carry them.
+	if e.versions != nil {
+		if err := e.versions.DeleteVersions(ctx, ""); err != nil {
+			return nil, internalErr(err, "clearing versions failed")
+		}
 	}
 	if err := e.store.ReplaceAll(ctx, export.Items); err != nil {
 		return nil, internalErr(err, "content replacement failed")
@@ -77,6 +92,12 @@ func validateContentExport(export ContentExport) error {
 	if err := validateContentItems(export.Items); err != nil {
 		return err
 	}
+	if err := validateContentTree(export.Items); err != nil {
+		return err
+	}
+	if err := validateContentTags(export.Items); err != nil {
+		return err
+	}
 	checksum, err := contentItemsChecksum(export.Items)
 	if err != nil {
 		return fmt.Errorf("calculate content export checksum: %w", err)
@@ -111,6 +132,80 @@ func validateContentItems(items []*ContentItem) error {
 			return fmt.Errorf("content export contains duplicate key %q", item.Key)
 		}
 		keys[item.Key] = struct{}{}
+	}
+	return nil
+}
+
+// validateContentTree checks the tree invariants an import must satisfy: placed items have
+// a valid name unique within their parent, every parent is in the payload, there are no
+// cycles, and no live item sits under an archived parent. Without a schema registry it
+// cannot check ChildTypes. Exports deliberately skip it so a backup always succeeds.
+func validateContentTree(items []*ContentItem) error {
+	byID := make(map[string]*ContentItem, len(items))
+	for _, item := range items {
+		byID[item.ID] = item
+	}
+	names := map[[2]string]string{}
+	for _, item := range items {
+		if item.Name == "" {
+			if item.ParentID != "" {
+				return fmt.Errorf("content export item %q has a parent but no name", item.ID)
+			}
+			continue
+		}
+		if err := validateName(item.Name); err != nil {
+			return fmt.Errorf("content export item %q: %w", item.ID, err)
+		}
+		placement := [2]string{item.ParentID, item.Name}
+		if other, exists := names[placement]; exists {
+			return fmt.Errorf("content export items %q and %q have the same name %q in one parent", other, item.ID, item.Name)
+		}
+		names[placement] = item.ID
+		if item.ParentID == "" {
+			continue
+		}
+		parent, exists := byID[item.ParentID]
+		if !exists {
+			return fmt.Errorf("content export item %q has a missing parent %q", item.ID, item.ParentID)
+		}
+		if item.ArchivedAt == nil && parent.ArchivedAt != nil {
+			return fmt.Errorf("content export item %q is not archived but its parent %q is", item.ID, parent.ID)
+		}
+	}
+	// Every parent exists now, so walking up from each item ends at the root or a cycle.
+	acyclic := map[string]bool{}
+	for _, item := range items {
+		seen := map[string]bool{}
+		for id := item.ID; id != "" && !acyclic[id]; id = byID[id].ParentID {
+			if seen[id] {
+				return fmt.Errorf("content export tree contains a cycle at %q", id)
+			}
+			seen[id] = true
+		}
+		for id := range seen {
+			acyclic[id] = true
+		}
+	}
+	return nil
+}
+
+// validateContentTags checks the tags an import would store: valid tag IDs and finite
+// weights. The type's tag policy is not checked, just as fields are not re-validated.
+func validateContentTags(items []*ContentItem) error {
+	for _, item := range items {
+		for _, snapshot := range []*ContentSnapshot{item.Draft, item.Published} {
+			if snapshot == nil {
+				continue
+			}
+			for id, weight := range snapshot.Tags {
+				if err := validateTagID(id); err != nil {
+					return fmt.Errorf("content export item %q: %w", item.ID, err)
+				}
+				if !isFinite(weight) {
+					return fmt.Errorf("content export item %q: tag %q has a non-finite weight", item.ID, id)
+				}
+			}
+		}
 	}
 	return nil
 }

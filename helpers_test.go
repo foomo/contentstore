@@ -1,13 +1,16 @@
 package contentstore
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testType is a representative content type used across the core tests. It mirrors
@@ -74,10 +77,24 @@ func validFields() ContentFields {
 	})
 }
 
-// fakeStore is an in-memory Store for engine unit tests.
+// fakeStore is an in-memory TreeStore for engine unit tests. It mirrors the unique key
+// and (parentId, name) indexes of the MongoDB persistor.
 type fakeStore struct {
 	mu    sync.Mutex
 	items map[string]*ContentItem
+
+	treeMu           sync.Mutex
+	treeTransactions int
+
+	// beforeWrite, when set, runs before Upsert and UpdateTags apply, to inject a
+	// concurrent write between an engine's load and its write.
+	beforeWrite func()
+}
+
+func (f *fakeStore) runBeforeWrite() {
+	if hook := f.beforeWrite; hook != nil {
+		hook()
+	}
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{items: map[string]*ContentItem{}} }
@@ -103,8 +120,12 @@ func (f *fakeStore) GetByKey(_ context.Context, key string) (*ContentItem, error
 }
 
 func (f *fakeStore) Upsert(_ context.Context, item *ContentItem, expectedDraftRevision *int64) error {
+	f.runBeforeWrite()
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.nameTaken(item) {
+		return errDuplicateName
+	}
 	existing := f.items[item.ID]
 	if expectedDraftRevision != nil {
 		switch {
@@ -118,6 +139,21 @@ func (f *fakeStore) Upsert(_ context.Context, item *ContentItem, expectedDraftRe
 	}
 	f.items[item.ID] = cloneContentItem(item)
 	return nil
+}
+
+var errDuplicateName = errors.New("fake store: duplicate (parentId, name)")
+
+// nameTaken mirrors the persistor's partial unique (parentId, name) index.
+func (f *fakeStore) nameTaken(item *ContentItem) bool {
+	if item.Name == "" {
+		return false
+	}
+	for _, other := range f.items {
+		if other.ID != item.ID && other.ParentID == item.ParentID && other.Name == item.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeStore) hasKey(key string) bool {
@@ -144,6 +180,11 @@ func (f *fakeStore) SetField(_ context.Context, in FieldUpdate) (*ContentItem, e
 	case in.Match.Key != "":
 		for _, it := range f.items {
 			if it.Key == in.Match.Key {
+				// The persistor's key upsert also matches the type; a key held by another
+				// type makes its insert fail on the unique key index.
+				if it.Type != in.Type {
+					return nil, ErrConflict
+				}
 				item = it
 			}
 		}
@@ -165,12 +206,17 @@ func (f *fakeStore) SetField(_ context.Context, in FieldUpdate) (*ContentItem, e
 		createdAt = item.Draft.CreatedAt
 		base = item.Draft.Fields
 	}
+	var tags TagSet // the persistor's targeted $set leaves draft.tags alone
+	if item.Draft != nil {
+		tags = item.Draft.Tags
+	}
 	item.Type = in.Type
 	item.Draft = &ContentSnapshot{
 		Revision:      revision,
 		SchemaVersion: in.SchemaVersion,
 		SchemaHash:    in.SchemaHash,
 		Fields:        mergeFieldValue(base, in.FieldID, in.Locale, in.Value),
+		Tags:          tags,
 		CreatedAt:     createdAt,
 		UpdatedAt:     in.Now,
 	}
@@ -285,6 +331,162 @@ func (f *fakeStore) ReplaceAll(_ context.Context, items []*ContentItem) error {
 	return nil
 }
 
+// UpdateTags mirrors Persistor.UpdateTags: a compare-and-swap on the draft revision.
+func (f *fakeStore) UpdateTags(_ context.Context, u TagUpdate) (*ContentItem, error) {
+	f.runBeforeWrite()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item := f.items[u.ID]
+	if item == nil || item.ArchivedAt != nil || item.Draft == nil || item.Draft.Revision != u.ExpectedRevision {
+		return nil, ErrConflict
+	}
+	var tags TagSet
+	if len(u.Tags) > 0 {
+		tags = maps.Clone(u.Tags)
+	}
+	draft := *item.Draft
+	draft.Tags = tags
+	draft.Revision++
+	draft.SchemaVersion, draft.SchemaHash = u.SchemaVersion, u.SchemaHash
+	draft.UpdatedAt = u.Now
+	item.Draft = &draft
+	item.UpdatedAt = u.Now
+	return cloneContentItem(item), nil
+}
+
+// MergeTags mirrors Persistor.MergeTags: a compare-and-swap on both snapshot revisions.
+func (f *fakeStore) MergeTags(_ context.Context, m TagMerge) (*ContentItem, error) {
+	f.runBeforeWrite()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	item := f.items[m.ID]
+	if item == nil || item.ArchivedAt != nil || item.Draft == nil || item.Draft.Revision != m.ExpectedRevision {
+		return nil, ErrConflict
+	}
+	if expected := m.ExpectedPublishedRevision; (expected == nil) != (item.Published == nil) ||
+		expected != nil && item.Published.Revision != *expected {
+		return nil, ErrConflict
+	}
+	// Like the persistor, an emptied set is stored as no tags.
+	tagsOrNil := func(tags TagSet) TagSet {
+		if len(tags) == 0 {
+			return nil
+		}
+		return maps.Clone(tags)
+	}
+	draft := *item.Draft
+	draft.Revision++
+	if m.DraftTags != nil {
+		draft.Tags = tagsOrNil(m.DraftTags)
+		draft.SchemaVersion, draft.SchemaHash = m.SchemaVersion, m.SchemaHash
+		draft.UpdatedAt = m.Now
+	}
+	if item.Published != nil {
+		published := *item.Published
+		if m.PublishedTags != nil {
+			published.Tags = tagsOrNil(m.PublishedTags)
+			published.UpdatedAt = m.Now
+		}
+		if published.Revision == m.ExpectedRevision {
+			published.Revision = draft.Revision
+		}
+		item.Published = &published
+	}
+	item.Draft = &draft
+	item.UpdatedAt = m.Now
+	return cloneContentItem(item), nil
+}
+
+// RunTreeTransaction serializes tree transactions like the persistor's lock document. It
+// has no rollback: engine transactions validate first and write last.
+func (f *fakeStore) RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	f.treeMu.Lock()
+	defer f.treeMu.Unlock()
+	f.treeTransactions++
+	return fn(ctx)
+}
+
+func (f *fakeStore) FindChildren(_ context.Context, q ChildQuery) ([]*ContentItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*ContentItem
+	for _, it := range f.items {
+		switch {
+		case it.Name == "" || it.ParentID != q.ParentID || it.Name <= q.AfterName:
+			continue
+		case q.Name != "" && it.Name != q.Name:
+			continue
+		case q.Lifecycle == LifecycleLive && it.ArchivedAt != nil:
+			continue
+		case q.Lifecycle == LifecyclePublished && (it.Published == nil || it.ArchivedAt != nil):
+			continue
+		case len(q.Types) > 0 && !containsType(q.Types, it.Type):
+			continue
+		case q.Tags != nil && !q.Tags.matches(snapshotTags(it, q.TagView)):
+			continue
+		}
+		out = append(out, projectItem(cloneContentItem(it), q.Fields))
+	}
+	slices.SortFunc(out, func(a, b *ContentItem) int { return strings.Compare(a.Name, b.Name) })
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+// FindTagged mirrors Persistor.FindTagged: weight descending, ID descending, keyset.
+func (f *fakeStore) FindTagged(_ context.Context, q TagQuery) ([]*ContentItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	weight := func(it *ContentItem) float64 { return snapshotTags(it, q.View)[q.Tag] }
+	var out []*ContentItem
+	for _, it := range f.items {
+		if _, ok := snapshotTags(it, q.View)[q.Tag]; !ok || it.ArchivedAt != nil {
+			continue
+		}
+		if len(q.Types) > 0 && !containsType(q.Types, it.Type) {
+			continue
+		}
+		if a := q.After; a != nil && (weight(it) > a.Weight || weight(it) == a.Weight && it.ID >= a.ID) {
+			continue
+		}
+		out = append(out, it)
+	}
+	slices.SortFunc(out, func(a, b *ContentItem) int {
+		return cmp.Or(cmp.Compare(weight(b), weight(a)), strings.Compare(b.ID, a.ID))
+	})
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	for i, it := range out {
+		out[i] = projectItem(cloneContentItem(it), q.Fields)
+	}
+	return out, nil
+}
+
+// projectItem mirrors the persistor's FindChildren projection.
+func projectItem(item *ContentItem, fields []FieldID) *ContentItem {
+	if fields == nil {
+		return item
+	}
+	for _, snapshot := range []*ContentSnapshot{item.Draft, item.Published} {
+		if snapshot == nil {
+			continue
+		}
+		var projected ContentFields
+		for _, f := range fields {
+			if v, ok := snapshot.Fields[string(f)]; ok {
+				if projected == nil {
+					projected = ContentFields{}
+				}
+				projected[string(f)] = v
+			}
+		}
+		snapshot.Fields = projected
+	}
+	return item
+}
+
 func cloneContentItem(item *ContentItem) *ContentItem {
 	if item == nil {
 		return nil
@@ -292,10 +494,12 @@ func cloneContentItem(item *ContentItem) *ContentItem {
 	clone := *item
 	if item.Draft != nil {
 		draft := *item.Draft
+		draft.Tags = maps.Clone(draft.Tags)
 		clone.Draft = &draft
 	}
 	if item.Published != nil {
 		published := *item.Published
+		published.Tags = maps.Clone(published.Tags)
 		clone.Published = &published
 	}
 	if item.OwnerRef != nil {
@@ -335,4 +539,147 @@ func seedPublishable(t *testing.T, e *Engine, key, ownerID string) {
 	}); err != nil {
 		t.Fatalf("seed draft: %v", err)
 	}
+}
+
+// fakeScheduleStore adds scheduled actions to the in-memory store. It mirrors the
+// persistor's unique (itemId, at) index on pending actions and its runner lease. It embeds
+// *fakeStore, so the stores of existing tests keep no scheduled actions.
+type fakeScheduleStore struct {
+	*fakeStore
+	smu        sync.Mutex
+	actions    map[string]*ScheduledAction
+	holder     string
+	leaseUntil time.Time
+}
+
+func newFakeScheduleStore() *fakeScheduleStore {
+	return &fakeScheduleStore{fakeStore: newFakeStore(), actions: map[string]*ScheduledAction{}}
+}
+
+func (f *fakeScheduleStore) SchedulesEnabled() bool { return true }
+
+func (f *fakeScheduleStore) pendingTaken(a *ScheduledAction) bool {
+	if a.Status != ActionPending {
+		return false
+	}
+	for _, other := range f.actions {
+		if other.ID != a.ID && other.Status == ActionPending && other.ItemID == a.ItemID && other.At.Equal(a.At) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeScheduleStore) InsertScheduledAction(_ context.Context, a *ScheduledAction) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if _, ok := f.actions[a.ID]; ok || f.pendingTaken(a) {
+		return ErrConflict
+	}
+	clone := *a
+	f.actions[a.ID] = &clone
+	return nil
+}
+
+func (f *fakeScheduleStore) GetScheduledAction(_ context.Context, id string) (*ScheduledAction, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	a, ok := f.actions[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	clone := *a
+	return &clone, nil
+}
+
+func scheduleQueryMatches(q ScheduledActionQuery, a *ScheduledAction) bool {
+	switch {
+	case q.ID != "" && a.ID != q.ID,
+		q.ItemID != "" && a.ItemID != q.ItemID,
+		len(q.Statuses) > 0 && !slices.Contains(q.Statuses, a.Status),
+		q.From != nil && a.At.Before(*q.From),
+		q.To != nil && !a.At.Before(*q.To):
+		return false
+	case q.After != nil:
+		return a.At.After(q.After.At) || a.At.Equal(q.After.At) && a.ID > q.After.ID
+	}
+	return true
+}
+
+func (f *fakeScheduleStore) FindScheduledActions(_ context.Context, q ScheduledActionQuery) ([]*ScheduledAction, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	var out []*ScheduledAction
+	for _, a := range f.actions {
+		if scheduleQueryMatches(q, a) {
+			clone := *a
+			out = append(out, &clone)
+		}
+	}
+	slices.SortFunc(out, func(a, b *ScheduledAction) int {
+		return cmp.Or(a.At.Compare(b.At), strings.Compare(a.ID, b.ID))
+	})
+	if q.Limit > 0 && len(out) > q.Limit {
+		out = out[:q.Limit]
+	}
+	return out, nil
+}
+
+func (f *fakeScheduleStore) UpdateScheduledAction(_ context.Context, a *ScheduledAction, from ...ScheduledActionStatus) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	stored, ok := f.actions[a.ID]
+	if !ok || !slices.Contains(from, stored.Status) {
+		return ErrConflict
+	}
+	if f.pendingTaken(a) {
+		return errors.New("fake schedule store: duplicate pending (itemId, at)")
+	}
+	clone := *a
+	f.actions[a.ID] = &clone
+	return nil
+}
+
+func (f *fakeScheduleStore) DeleteScheduledActions(_ context.Context, q ScheduledActionQuery) (int64, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	q = ScheduledActionQuery{ID: q.ID, ItemID: q.ItemID, Statuses: q.Statuses}
+	var n int64
+	for id, a := range f.actions {
+		if scheduleQueryMatches(q, a) {
+			delete(f.actions, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (f *fakeScheduleStore) AcquireScheduleRunner(_ context.Context, holder string, until time.Time) (bool, error) {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if f.holder != "" && f.holder != holder && !f.leaseUntil.Before(time.Now()) {
+		return false, nil
+	}
+	f.holder, f.leaseUntil = holder, until
+	return true, nil
+}
+
+func (f *fakeScheduleStore) ReleaseScheduleRunner(_ context.Context, holder string) error {
+	f.smu.Lock()
+	defer f.smu.Unlock()
+	if f.holder == holder {
+		f.holder, f.leaseUntil = "", time.Time{}
+	}
+	return nil
+}
+
+// action returns the stored scheduled action with the given ID, failing the test when it
+// does not exist.
+func (f *fakeScheduleStore) action(t *testing.T, id string) ScheduledAction {
+	t.Helper()
+	a, err := f.GetScheduledAction(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get scheduled action %q: %v", id, err)
+	}
+	return *a
 }

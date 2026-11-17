@@ -6,6 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -13,29 +17,116 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
 const collectionContentItems = "content_items"
 
-// Persistor is the MongoDB-backed Store. It depends only on the mongo driver.
-type Persistor struct {
-	client *mongo.Client
-	coll   *mongo.Collection
+// collectionTreeLock holds the single document every tree transaction increments first,
+// which serializes tree writes. It is created on first tree use only.
+const (
+	collectionTreeLock = "content_tree_lock"
+	treeLockID         = "tree"
+)
+
+// Collections of scheduled actions (see WithSchedules). The runner collection holds the
+// single lease document of the scheduled-action runner.
+const (
+	collectionScheduledActions = "content_scheduled_actions"
+	collectionScheduleRunner   = "content_schedule_runner"
+	scheduleRunnerID           = "runner"
+)
+
+// errSchedulesDisabled is returned by the scheduled-action methods of a Persistor built
+// without WithSchedules.
+var errSchedulesDisabled = errors.New("contentstore: scheduled actions are not enabled (see WithSchedules)")
+
+// collectionVersions holds the published versions of items (see WithVersions).
+const collectionVersions = "content_versions"
+
+// errVersionsDisabled is returned by the version methods of a Persistor built without
+// WithVersions.
+var errVersionsDisabled = errors.New("contentstore: versions are not enabled (see WithVersions)")
+
+// Index names of the tag rankings (see WithTagIndexes).
+const (
+	indexDraftTagsRank     = "draft_tags_rank"
+	indexPublishedTagsRank = "published_tags_rank"
+)
+
+// StoreOption configures NewMongoStore.
+type StoreOption func(*Persistor)
+
+// WithTagIndexes creates the indexes that serve tag rankings (ListTagged) from an index:
+// compound wildcard indexes on draft and published tags, which need MongoDB 7.0 or later
+// (NewMongoStore fails otherwise). Without them rankings stay correct but are sorted in
+// memory.
+func WithTagIndexes() StoreOption {
+	return func(p *Persistor) { p.tagIndexes = true }
 }
 
-var _ Store = (*Persistor)(nil)
+// WithSchedules enables scheduled actions (see ContentSchedules): NewMongoStore creates
+// their collection and indexes, and the first run creates the runner's lease collection.
+// Without it the store creates neither and an Engine over it rejects scheduled actions.
+func WithSchedules() StoreOption {
+	return func(p *Persistor) { p.schedules = true }
+}
+
+// WithVersions enables version history (see ContentVersions): NewMongoStore creates the
+// versions collection and its index. Without it the store creates neither, and an Engine
+// over it rejects the version methods and publishes of types with a VersionPolicy.
+func WithVersions() StoreOption {
+	return func(p *Persistor) { p.versions = true }
+}
+
+// Persistor is the MongoDB-backed Store. It depends only on the mongo driver.
+type Persistor struct {
+	client     *mongo.Client
+	coll       *mongo.Collection
+	tagIndexes bool
+	schedules  bool
+	versions   bool
+	// tagHintMissing records that a ranking index was missing, so later rankings skip the
+	// hint instead of failing it first.
+	tagHintMissing atomic.Bool
+
+	treeLockMu    sync.Mutex
+	treeLockReady bool
+}
+
+var (
+	_ TreeStore     = (*Persistor)(nil)
+	_ TagStore      = (*Persistor)(nil)
+	_ ScheduleStore = (*Persistor)(nil)
+	_ VersionStore  = (*Persistor)(nil)
+)
 
 // NewMongoStore connects to MongoDB (database taken from the connection string) and
 // ensures the content_items indexes, returning a ready Store.
-func NewMongoStore(ctx context.Context, mongoURL string) (*Persistor, error) {
+func NewMongoStore(ctx context.Context, mongoURL string, opts ...StoreOption) (*Persistor, error) {
 	client, db, err := connect(mongoURL)
 	if err != nil {
 		return nil, err
 	}
 	p := &Persistor{client: client, coll: client.Database(db).Collection(collectionContentItems)}
+	for _, opt := range opts {
+		opt(p)
+	}
 	if err := p.ensureIndexes(ctx); err != nil {
 		_ = client.Disconnect(context.Background())
 		return nil, err
+	}
+	if p.schedules {
+		if err := p.ensureScheduleIndexes(ctx); err != nil {
+			_ = client.Disconnect(context.Background())
+			return nil, err
+		}
+	}
+	if p.versions {
+		if err := p.ensureVersionIndexes(ctx); err != nil {
+			_ = client.Disconnect(context.Background())
+			return nil, err
+		}
 	}
 	return p, nil
 }
@@ -44,10 +135,15 @@ func NewMongoStore(ctx context.Context, mongoURL string) (*Persistor, error) {
 func (p *Persistor) Close() error { return p.client.Disconnect(context.Background()) }
 
 func (p *Persistor) ensureIndexes(ctx context.Context) error {
-	return ensureIndexes(ctx, p.coll)
+	return ensureIndexes(ctx, p.coll, p.tagIndexes)
 }
 
-func ensureIndexes(ctx context.Context, coll *mongo.Collection) error {
+func ensureIndexes(ctx context.Context, coll *mongo.Collection, tagIndexes bool) error {
+	if tagIndexes {
+		if err := ensureTagIndexes(ctx, coll); err != nil {
+			return err
+		}
+	}
 	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		// Unique key where present (partial: excludes items with no/empty key).
 		{
@@ -69,6 +165,14 @@ func ensureIndexes(ctx context.Context, coll *mongo.Collection) error {
 		{
 			Keys:    bson.D{{Key: "type", Value: 1}},
 			Options: options.Index().SetName("type"),
+		},
+		// Tree names unique within a parent (a missing parentId is root level), and
+		// name-ordered child listing. Partial: excludes every item without a name, which
+		// is every item of a non-tree type.
+		{
+			Keys: bson.D{{Key: "parentId", Value: 1}, {Key: "name", Value: 1}},
+			Options: options.Index().SetName("parent_name_unique").SetUnique(true).
+				SetPartialFilterExpression(bson.D{{Key: "name", Value: bson.D{{Key: "$gt", Value: ""}}}}),
 		},
 	})
 	if err != nil {
@@ -128,7 +232,7 @@ func (p *Persistor) ReplaceAll(ctx context.Context, items []*ContentItem) error 
 		_ = temp.Drop(cleanupCtx)
 	}()
 
-	if err := ensureIndexes(ctx, temp); err != nil {
+	if err := ensureIndexes(ctx, temp, p.tagIndexes); err != nil {
 		return fmt.Errorf("contentstore: prepare replacement collection: %w", err)
 	}
 	if len(items) > 0 {
@@ -247,7 +351,7 @@ func draftReplaceFilter(itemID string, expectedDraftRevision *int64) bson.D {
 // of concurrent per-field writes all land instead of clobbering each other. A nil value
 // clears that locale.
 func (p *Persistor) SetField(ctx context.Context, in FieldUpdate) (*ContentItem, error) {
-	filter, upsert := fieldUpdateFilter(in.Match)
+	filter, upsert := fieldUpdateFilter(in.Match, in.Type)
 	update := fieldUpdateDocument(in)
 	opts := options.FindOneAndUpdate().SetReturnDocument(options.After).SetUpsert(upsert)
 
@@ -257,6 +361,10 @@ func (p *Persistor) SetField(ctx context.Context, in FieldUpdate) (*ContentItem,
 		// Lost a concurrent create race on the same key: the document now exists, so a
 		// single retry resolves to it and applies the field update instead of inserting.
 		err = p.coll.FindOneAndUpdate(ctx, filter, update, opts).Decode(item)
+		if mongo.IsDuplicateKeyError(err) {
+			// The key is held by an item of another type.
+			return nil, ErrConflict
+		}
 	}
 	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
@@ -269,9 +377,12 @@ func (p *Persistor) SetField(ctx context.Context, in FieldUpdate) (*ContentItem,
 
 // fieldUpdateFilter selects the target document and whether a missing one is created. A
 // key match upserts (create-or-update); an id-only match must resolve to an existing item.
-func fieldUpdateFilter(m ContentItemMatch) (bson.D, bool) {
+// The key match also requires the type, so an item of another type created concurrently
+// under the same key makes the upsert fail on the unique key instead of having its type
+// overwritten.
+func fieldUpdateFilter(m ContentItemMatch, t ContentType) (bson.D, bool) {
 	if m.Key != "" {
-		return bson.D{{Key: "key", Value: m.Key}}, true
+		return bson.D{{Key: "key", Value: m.Key}, {Key: "type", Value: t}}, true
 	}
 	return bson.D{{Key: "_id", Value: m.ID}}, false
 }
@@ -388,4 +499,704 @@ func findCollection(ctx context.Context, coll *mongo.Collection, filter bson.D) 
 		return nil, fmt.Errorf("contentstore: find decode: %w", err)
 	}
 	return items, nil
+}
+
+// RunTreeTransaction runs fn in a MongoDB transaction whose first write increments the
+// tree lock document. Concurrent tree transactions therefore write-conflict on that
+// document and the driver retries the loser after the winner commits, which serializes
+// tree writes: checks such as "parent exists" or "no cycle" cannot be invalidated by a
+// concurrent tree write before fn commits. Requires a replica set.
+func (p *Persistor) RunTreeTransaction(ctx context.Context, fn func(ctx context.Context) error) error {
+	if err := p.ensureTreeLock(ctx); err != nil {
+		return err
+	}
+	session, err := p.client.StartSession()
+	if err != nil {
+		return fmt.Errorf("contentstore: start tree session: %w", err)
+	}
+	defer session.EndSession(ctx)
+
+	lock := p.coll.Database().Collection(collectionTreeLock)
+	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
+		res, err := lock.UpdateOne(txCtx, bson.D{{Key: "_id", Value: treeLockID}}, bson.D{{Key: "$inc", Value: bson.D{{Key: "seq", Value: int64(1)}}}})
+		if err != nil {
+			return nil, fmt.Errorf("contentstore: acquire tree lock: %w", err)
+		}
+		if res.MatchedCount == 0 {
+			// Without the lock document nothing would serialize this transaction.
+			p.treeLockMu.Lock()
+			p.treeLockReady = false
+			p.treeLockMu.Unlock()
+			return nil, errors.New("contentstore: tree lock document is missing")
+		}
+		return nil, fn(txCtx)
+	}, options.Transaction().
+		SetReadConcern(readconcern.Snapshot()).
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadPreference(readpref.Primary()))
+	if err != nil {
+		return fmt.Errorf("contentstore: tree transaction: %w", err)
+	}
+	return nil
+}
+
+// ensureTreeLock creates the lock collection and document outside any transaction, once
+// per Persistor; a failed attempt is retried on the next call. Concurrent creation by
+// other instances is tolerated.
+func (p *Persistor) ensureTreeLock(ctx context.Context) error {
+	p.treeLockMu.Lock()
+	defer p.treeLockMu.Unlock()
+	if p.treeLockReady {
+		return nil
+	}
+	database := p.coll.Database()
+	if err := database.CreateCollection(ctx, collectionTreeLock); err != nil && !isNamespaceExists(err) {
+		return fmt.Errorf("contentstore: create tree lock collection: %w", err)
+	}
+	_, err := database.Collection(collectionTreeLock).UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: treeLockID}},
+		bson.D{{Key: "$setOnInsert", Value: bson.D{{Key: "seq", Value: int64(0)}}}},
+		options.UpdateOne().SetUpsert(true))
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		return fmt.Errorf("contentstore: create tree lock: %w", err)
+	}
+	p.treeLockReady = true
+	return nil
+}
+
+// isNamespaceExists reports MongoDB's NamespaceExists error (code 48).
+func isNamespaceExists(err error) bool {
+	serverErr, ok := errors.AsType[mongo.ServerError](err)
+	return ok && serverErr.HasErrorCode(48)
+}
+
+// FindChildren returns the items placed under q.ParentID (named root-level items when
+// empty), ordered by name.
+func (p *Persistor) FindChildren(ctx context.Context, q ChildQuery) ([]*ContentItem, error) {
+	opts := options.Find().SetSort(bson.D{{Key: "name", Value: 1}})
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	if q.Fields != nil {
+		opts.SetProjection(childProjection(q.Fields))
+	}
+	cur, err := p.coll.Find(ctx, childFilter(q), opts)
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find children: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var items []*ContentItem
+	if err := cur.All(ctx, &items); err != nil {
+		return nil, fmt.Errorf("contentstore: find children decode: %w", err)
+	}
+	return items, nil
+}
+
+// childFilter builds the FindChildren filter. It always constrains name to be non-empty
+// so the query can use the partial parent_name_unique index.
+func childFilter(q ChildQuery) bson.D {
+	var parent any = q.ParentID
+	if q.ParentID == "" {
+		parent = nil // matches a missing parentId: root level
+	}
+	name := bson.D{{Key: "$gt", Value: q.AfterName}}
+	if q.Name != "" {
+		name = append(name, bson.E{Key: "$eq", Value: q.Name})
+	}
+	filter := bson.D{
+		{Key: "parentId", Value: parent},
+		{Key: "name", Value: name},
+	}
+	switch q.Lifecycle {
+	case LifecycleLive:
+		filter = append(filter, bson.E{Key: "archivedAt", Value: nil})
+	case LifecyclePublished:
+		filter = append(filter,
+			bson.E{Key: "published", Value: bson.D{{Key: "$ne", Value: nil}}},
+			bson.E{Key: "archivedAt", Value: nil},
+		)
+	}
+	if len(q.Types) > 0 {
+		filter = append(filter, bson.E{Key: "type", Value: bson.D{{Key: "$in", Value: q.Types}}})
+	}
+	return append(filter, tagFilterConditions(q.Tags, q.TagView)...)
+}
+
+// tagFilterConditions translates a tag filter on view's tags into query conditions.
+func tagFilterConditions(f *TagFilter, view SnapshotView) bson.D {
+	if f == nil {
+		return nil
+	}
+	path := func(id string) string { return snapshotPath(view) + ".tags." + escapeTagKey(id) }
+	var conditions bson.D
+	for _, id := range f.All {
+		conditions = append(conditions, bson.E{Key: path(id), Value: bson.D{{Key: "$exists", Value: true}}})
+	}
+	for _, id := range f.None {
+		conditions = append(conditions, bson.E{Key: path(id), Value: bson.D{{Key: "$exists", Value: false}}})
+	}
+	if len(f.Any) > 0 {
+		anyOf := make(bson.A, 0, len(f.Any))
+		for _, id := range f.Any {
+			anyOf = append(anyOf, bson.D{{Key: path(id), Value: bson.D{{Key: "$exists", Value: true}}}})
+		}
+		conditions = append(conditions, bson.E{Key: "$or", Value: anyOf})
+	}
+	return conditions
+}
+
+// snapshotPath is the document field holding view's snapshot.
+func snapshotPath(view SnapshotView) string {
+	if view == SnapshotViewPublished {
+		return "published"
+	}
+	return "draft"
+}
+
+// childProjection keeps everything but the snapshot field sets, of which it keeps only
+// the requested fields (none for an empty list). Tags are always kept.
+func childProjection(fields []FieldID) bson.D {
+	projection := bson.D{
+		{Key: "key", Value: 1}, {Key: "type", Value: 1}, {Key: "ownerRef", Value: 1},
+		{Key: "parentId", Value: 1}, {Key: "name", Value: 1}, {Key: "archivedAt", Value: 1},
+		{Key: "createdAt", Value: 1}, {Key: "updatedAt", Value: 1},
+	}
+	for _, snapshot := range []string{"draft", "published"} {
+		for _, f := range []string{"revision", "schemaVersion", "schemaHash", "tags", "createdAt", "updatedAt"} {
+			projection = append(projection, bson.E{Key: snapshot + "." + f, Value: 1})
+		}
+		for _, f := range fields {
+			projection = append(projection, bson.E{Key: snapshot + ".fields." + string(f), Value: 1})
+		}
+	}
+	return projection
+}
+
+// UpdateTags replaces the draft tag set when the item is not archived and its draft
+// revision is still u.ExpectedRevision, bumping the revision; ErrConflict otherwise. The
+// tag document is built with escaped keys here rather than through the TagSet codec.
+func (p *Persistor) UpdateTags(ctx context.Context, u TagUpdate) (*ContentItem, error) {
+	filter := bson.D{
+		{Key: "_id", Value: u.ID},
+		{Key: "archivedAt", Value: nil},
+		{Key: "draft.revision", Value: u.ExpectedRevision},
+	}
+	set := bson.D{
+		{Key: "updatedAt", Value: u.Now},
+		{Key: "draft.updatedAt", Value: u.Now},
+		{Key: "draft.schemaVersion", Value: u.SchemaVersion},
+		{Key: "draft.schemaHash", Value: u.SchemaHash},
+	}
+	update := bson.D{}
+	if len(u.Tags) == 0 {
+		update = append(update, bson.E{Key: "$unset", Value: bson.D{{Key: "draft.tags", Value: ""}}})
+	} else {
+		set = append(set, bson.E{Key: "draft.tags", Value: tagsDocument(u.Tags)})
+	}
+	update = append(update,
+		bson.E{Key: "$set", Value: set},
+		bson.E{Key: "$inc", Value: bson.D{{Key: "draft.revision", Value: int64(1)}}},
+	)
+	item := &ContentItem{}
+	err := p.coll.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(item)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: update tags: %w", err)
+	}
+	return item, nil
+}
+
+// MergeTags writes one item's tag merge as a single targeted update guarded by both
+// snapshot revisions; ErrConflict when the item changed since it was read.
+func (p *Persistor) MergeTags(ctx context.Context, m TagMerge) (*ContentItem, error) {
+	filter := bson.D{
+		{Key: "_id", Value: m.ID},
+		{Key: "archivedAt", Value: nil},
+		{Key: "draft.revision", Value: m.ExpectedRevision},
+	}
+	if m.ExpectedPublishedRevision == nil {
+		filter = append(filter, bson.E{Key: "published", Value: nil})
+	} else {
+		filter = append(filter, bson.E{Key: "published.revision", Value: *m.ExpectedPublishedRevision})
+	}
+	set := bson.D{{Key: "updatedAt", Value: m.Now}}
+	unset := bson.D{}
+	// An emptied set is unset, as UpdateTags stores an item without tags.
+	setTags := func(field string, tags TagSet) {
+		if len(tags) == 0 {
+			unset = append(unset, bson.E{Key: field, Value: ""})
+		} else {
+			set = append(set, bson.E{Key: field, Value: tagsDocument(tags)})
+		}
+	}
+	if m.DraftTags != nil {
+		setTags("draft.tags", m.DraftTags)
+		set = append(set,
+			bson.E{Key: "draft.updatedAt", Value: m.Now},
+			bson.E{Key: "draft.schemaVersion", Value: m.SchemaVersion},
+			bson.E{Key: "draft.schemaHash", Value: m.SchemaHash},
+		)
+	}
+	if m.ExpectedPublishedRevision != nil {
+		if m.PublishedTags != nil {
+			setTags("published.tags", m.PublishedTags)
+			set = append(set, bson.E{Key: "published.updatedAt", Value: m.Now})
+		}
+		if *m.ExpectedPublishedRevision == m.ExpectedRevision {
+			set = append(set, bson.E{Key: "published.revision", Value: m.ExpectedRevision + 1})
+		}
+	}
+	update := bson.D{
+		{Key: "$set", Value: set},
+		{Key: "$inc", Value: bson.D{{Key: "draft.revision", Value: int64(1)}}},
+	}
+	if len(unset) > 0 {
+		update = append(update, bson.E{Key: "$unset", Value: unset})
+	}
+	item := &ContentItem{}
+	err := p.coll.FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(item)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: merge tags: %w", err)
+	}
+	return item, nil
+}
+
+// ensureTagIndexes creates the tag ranking indexes: a compound wildcard index per snapshot
+// whose _id suffix makes "carries tag X, by X's weight, ties by _id" an index scan,
+// including keyset pages. Documents without tags have no wildcard entries.
+func ensureTagIndexes(ctx context.Context, coll *mongo.Collection) error {
+	_, err := coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys:    bson.D{{Key: "draft.tags.$**", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName(indexDraftTagsRank),
+		},
+		{
+			Keys:    bson.D{{Key: "published.tags.$**", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName(indexPublishedTagsRank),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure tag indexes (MongoDB 7.0+ required): %w", err)
+	}
+	return nil
+}
+
+// FindTagged ranks the non-archived items carrying q.Tag by its weight. The weight
+// predicate is a numeric range (not $exists) so the wildcard index can provide the order;
+// a keyset page is the union of "lower weight" and "same weight, lower _id". When tag
+// indexes are enabled the query hints the ranking index; if that index is missing (e.g.
+// after a ReplaceAll by an instance configured without it) it falls back to unhinted
+// queries for the rest of the Persistor's life.
+func (p *Persistor) FindTagged(ctx context.Context, q TagQuery) ([]*ContentItem, error) {
+	filter, sort, projection := tagQueryParts(q)
+	opts := options.Find().SetSort(sort)
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	if projection != nil {
+		opts.SetProjection(projection)
+	}
+	hinted := p.tagIndexes && !p.tagHintMissing.Load()
+	if hinted {
+		opts.SetHint(tagRankIndex(q.View))
+	}
+	cur, err := p.coll.Find(ctx, filter, opts)
+	if err != nil && hinted && isMissingHintIndex(err) {
+		p.tagHintMissing.Store(true)
+		opts.SetHint(nil)
+		cur, err = p.coll.Find(ctx, filter, opts)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find tagged: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var items []*ContentItem
+	if err := cur.All(ctx, &items); err != nil {
+		return nil, fmt.Errorf("contentstore: find tagged decode: %w", err)
+	}
+	return items, nil
+}
+
+// tagQueryParts builds the filter, sort and projection (nil: everything) of a ranking page.
+func tagQueryParts(q TagQuery) (filter, sort, projection bson.D) {
+	rank := snapshotPath(q.View) + ".tags." + escapeTagKey(q.Tag)
+	filter = bson.D{{Key: "archivedAt", Value: nil}}
+	if q.After == nil {
+		filter = append(filter, bson.E{Key: rank, Value: bson.D{{Key: "$gte", Value: -math.MaxFloat64}}})
+	} else {
+		filter = append(filter, bson.E{Key: "$or", Value: bson.A{
+			bson.D{{Key: rank, Value: bson.D{{Key: "$lt", Value: q.After.Weight}}}},
+			bson.D{{Key: rank, Value: q.After.Weight}, {Key: "_id", Value: bson.D{{Key: "$lt", Value: q.After.ID}}}},
+		}})
+	}
+	if len(q.Types) > 0 {
+		filter = append(filter, bson.E{Key: "type", Value: bson.D{{Key: "$in", Value: q.Types}}})
+	}
+	sort = bson.D{{Key: rank, Value: -1}, {Key: "_id", Value: -1}}
+	if q.Fields != nil {
+		projection = childProjection(q.Fields)
+	}
+	return filter, sort, projection
+}
+
+func tagRankIndex(view SnapshotView) string {
+	if view == SnapshotViewPublished {
+		return indexPublishedTagsRank
+	}
+	return indexDraftTagsRank
+}
+
+// isMissingHintIndex reports MongoDB's error for a hint naming no existing index.
+func isMissingHintIndex(err error) bool {
+	return strings.Contains(err.Error(), "hint provided does not correspond to an existing index")
+}
+
+// SchedulesEnabled reports whether the Persistor was built with WithSchedules.
+func (p *Persistor) SchedulesEnabled() bool { return p.schedules }
+
+// scheduledActions returns the scheduled-action collection, or errSchedulesDisabled.
+func (p *Persistor) scheduledActions() (*mongo.Collection, error) {
+	if !p.schedules {
+		return nil, errSchedulesDisabled
+	}
+	return p.coll.Database().Collection(collectionScheduledActions), nil
+}
+
+// ensureScheduleIndexes creates the scheduled-action indexes. The partial unique index
+// allows one pending action per item and minute, which makes ScheduleAction's conflict
+// check atomic without a transaction. It covers pending actions only: a new action is
+// always in the future, and one that is running or done is due, so they cannot collide.
+func (p *Persistor) ensureScheduleIndexes(ctx context.Context) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	_, err = coll.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{
+			Keys: bson.D{{Key: "itemId", Value: 1}, {Key: "at", Value: 1}},
+			Options: options.Index().SetName("item_at_pending_unique").SetUnique(true).
+				SetPartialFilterExpression(bson.D{{Key: "status", Value: string(ActionPending)}}),
+		},
+		// Due actions, and lists by status and time.
+		{
+			Keys:    bson.D{{Key: "status", Value: 1}, {Key: "at", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("status_at"),
+		},
+		// An item's actions, and their removal when it is deleted.
+		{
+			Keys:    bson.D{{Key: "itemId", Value: 1}, {Key: "at", Value: 1}, {Key: "_id", Value: 1}},
+			Options: options.Index().SetName("itemId_at"),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure schedule indexes: %w", err)
+	}
+	return nil
+}
+
+// InsertScheduledAction stores a new action; ErrConflict when the item already has a
+// pending action at the same time.
+func (p *Persistor) InsertScheduledAction(ctx context.Context, action *ScheduledAction) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	if _, err := coll.InsertOne(ctx, action); err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return ErrConflict
+		}
+		return fmt.Errorf("contentstore: insert scheduled action: %w", err)
+	}
+	return nil
+}
+
+// GetScheduledAction returns the action with the given ID, or ErrNotFound.
+func (p *Persistor) GetScheduledAction(ctx context.Context, id string) (*ScheduledAction, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return nil, err
+	}
+	action := &ScheduledAction{}
+	if err := coll.FindOne(ctx, bson.D{{Key: "_id", Value: id}}).Decode(action); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("contentstore: get scheduled action: %w", err)
+	}
+	return action, nil
+}
+
+// FindScheduledActions returns the actions matching q, ordered by At, then ID.
+func (p *Persistor) FindScheduledActions(ctx context.Context, q ScheduledActionQuery) ([]*ScheduledAction, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return nil, err
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "at", Value: 1}, {Key: "_id", Value: 1}})
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	cur, err := coll.Find(ctx, scheduleFilter(q), opts)
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find scheduled actions: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var actions []*ScheduledAction
+	if err := cur.All(ctx, &actions); err != nil {
+		return nil, fmt.Errorf("contentstore: find scheduled actions decode: %w", err)
+	}
+	return actions, nil
+}
+
+// UpdateScheduledAction replaces the stored action if its status is one of from;
+// ErrConflict otherwise.
+func (p *Persistor) UpdateScheduledAction(ctx context.Context, action *ScheduledAction, from ...ScheduledActionStatus) error {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{
+		{Key: "_id", Value: action.ID},
+		{Key: "status", Value: bson.D{{Key: "$in", Value: from}}},
+	}
+	result, err := coll.ReplaceOne(ctx, filter, action)
+	if err != nil {
+		return fmt.Errorf("contentstore: update scheduled action: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// DeleteScheduledActions deletes the actions matching q's ID, ItemID and Statuses; an
+// empty query deletes every action.
+func (p *Persistor) DeleteScheduledActions(ctx context.Context, q ScheduledActionQuery) (int64, error) {
+	coll, err := p.scheduledActions()
+	if err != nil {
+		return 0, err
+	}
+	filter := scheduleFilter(ScheduledActionQuery{ID: q.ID, ItemID: q.ItemID, Statuses: q.Statuses})
+	result, err := coll.DeleteMany(ctx, filter)
+	if err != nil {
+		return 0, fmt.Errorf("contentstore: delete scheduled actions: %w", err)
+	}
+	return result.DeletedCount, nil
+}
+
+// scheduleFilter translates a scheduled-action query into a filter.
+func scheduleFilter(q ScheduledActionQuery) bson.D {
+	filter := bson.D{}
+	if q.ID != "" {
+		filter = append(filter, bson.E{Key: "_id", Value: q.ID})
+	}
+	if q.ItemID != "" {
+		filter = append(filter, bson.E{Key: "itemId", Value: q.ItemID})
+	}
+	if len(q.Statuses) > 0 {
+		filter = append(filter, bson.E{Key: "status", Value: bson.D{{Key: "$in", Value: q.Statuses}}})
+	}
+	at := bson.D{}
+	if q.From != nil {
+		at = append(at, bson.E{Key: "$gte", Value: *q.From})
+	}
+	if q.To != nil {
+		at = append(at, bson.E{Key: "$lt", Value: *q.To})
+	}
+	if len(at) > 0 {
+		filter = append(filter, bson.E{Key: "at", Value: at})
+	}
+	if q.After != nil {
+		filter = append(filter, bson.E{Key: "$or", Value: bson.A{
+			bson.D{{Key: "at", Value: bson.D{{Key: "$gt", Value: q.After.At}}}},
+			bson.D{{Key: "at", Value: q.After.At}, {Key: "_id", Value: bson.D{{Key: "$gt", Value: q.After.ID}}}},
+		}})
+	}
+	return filter
+}
+
+// AcquireScheduleRunner takes or extends the runner lease with one upsert of the lease
+// document: it matches when holder already has the lease or the lease has expired, and
+// otherwise tries to insert a second document with the same _id, which fails on the
+// duplicate key while another holder's lease is valid.
+func (p *Persistor) AcquireScheduleRunner(ctx context.Context, holder string, until time.Time) (bool, error) {
+	if !p.schedules {
+		return false, errSchedulesDisabled
+	}
+	coll := p.coll.Database().Collection(collectionScheduleRunner)
+	filter := bson.D{
+		{Key: "_id", Value: scheduleRunnerID},
+		{Key: "$or", Value: bson.A{
+			bson.D{{Key: "holder", Value: holder}},
+			bson.D{{Key: "leaseUntil", Value: bson.D{{Key: "$lt", Value: time.Now().UTC()}}}},
+		}},
+	}
+	update := bson.D{{Key: "$set", Value: bson.D{{Key: "holder", Value: holder}, {Key: "leaseUntil", Value: until}}}}
+	_, err := coll.UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
+	if mongo.IsDuplicateKeyError(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("contentstore: acquire schedule runner: %w", err)
+	}
+	return true, nil
+}
+
+// ReleaseScheduleRunner removes the lease document if holder has the lease.
+func (p *Persistor) ReleaseScheduleRunner(ctx context.Context, holder string) error {
+	if !p.schedules {
+		return errSchedulesDisabled
+	}
+	coll := p.coll.Database().Collection(collectionScheduleRunner)
+	if _, err := coll.DeleteOne(ctx, bson.D{{Key: "_id", Value: scheduleRunnerID}, {Key: "holder", Value: holder}}); err != nil {
+		return fmt.Errorf("contentstore: release schedule runner: %w", err)
+	}
+	return nil
+}
+
+// VersionsEnabled reports whether the Persistor was built with WithVersions.
+func (p *Persistor) VersionsEnabled() bool { return p.versions }
+
+// versionCollection returns the versions collection, or errVersionsDisabled.
+func (p *Persistor) versionCollection() (*mongo.Collection, error) {
+	if !p.versions {
+		return nil, errVersionsDisabled
+	}
+	return p.coll.Database().Collection(collectionVersions), nil
+}
+
+// ensureVersionIndexes creates the versions index: one version per item and revision, which
+// also serves an item's versions newest first and their pruning.
+func (p *Persistor) ensureVersionIndexes(ctx context.Context) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	_, err = coll.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "itemId", Value: 1}, {Key: "revision", Value: -1}},
+		Options: options.Index().SetName("item_revision_unique").SetUnique(true),
+	})
+	if err != nil {
+		return fmt.Errorf("contentstore: ensure version indexes: %w", err)
+	}
+	return nil
+}
+
+// InsertVersion stores v unless its item already has a version of its revision. It looks
+// before it inserts: inside a transaction a duplicate key would abort the transaction, and
+// tree transactions are serialized, so the look cannot be overtaken there. Outside one, a
+// concurrent insert of the same version loses on the unique index, which is ignored.
+func (p *Persistor) InsertVersion(ctx context.Context, v *ContentVersion) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{{Key: "itemId", Value: v.ItemID}, {Key: "revision", Value: v.Revision}}
+	err = coll.FindOne(ctx, filter, options.FindOne().SetProjection(bson.D{{Key: "_id", Value: 1}})).Err()
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, mongo.ErrNoDocuments) {
+		return fmt.Errorf("contentstore: find version: %w", err)
+	}
+	if _, err := coll.InsertOne(ctx, v); err != nil && !mongo.IsDuplicateKeyError(err) {
+		return fmt.Errorf("contentstore: insert version: %w", err)
+	}
+	return nil
+}
+
+// GetVersion returns item itemID's version of the given revision, or ErrNotFound.
+func (p *Persistor) GetVersion(ctx context.Context, itemID string, revision int64) (*ContentVersion, error) {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return nil, err
+	}
+	v := &ContentVersion{}
+	err = coll.FindOne(ctx, bson.D{{Key: "itemId", Value: itemID}, {Key: "revision", Value: revision}}).Decode(v)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: get version: %w", err)
+	}
+	return v, nil
+}
+
+// FindVersions returns the versions matching q, newest first, without their snapshots.
+func (p *Persistor) FindVersions(ctx context.Context, q VersionQuery) ([]*ContentVersion, error) {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return nil, err
+	}
+	filter := bson.D{{Key: "itemId", Value: q.ItemID}}
+	if q.Before > 0 {
+		filter = append(filter, bson.E{Key: "revision", Value: bson.D{{Key: "$lt", Value: q.Before}}})
+	}
+	opts := options.Find().
+		SetSort(bson.D{{Key: "revision", Value: -1}}).
+		SetProjection(bson.D{{Key: "snapshot", Value: 0}})
+	if q.Limit > 0 {
+		opts.SetLimit(int64(q.Limit))
+	}
+	cur, err := coll.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("contentstore: find versions: %w", err)
+	}
+	defer cur.Close(context.Background())
+
+	var versions []*ContentVersion
+	if err := cur.All(ctx, &versions); err != nil {
+		return nil, fmt.Errorf("contentstore: find versions decode: %w", err)
+	}
+	return versions, nil
+}
+
+// PruneVersions deletes item itemID's versions older than its newest keep.
+func (p *Persistor) PruneVersions(ctx context.Context, itemID string, keep int) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	var newestPruned struct {
+		Revision int64 `bson:"revision"`
+	}
+	err = coll.FindOne(ctx, bson.D{{Key: "itemId", Value: itemID}}, options.FindOne().
+		SetSort(bson.D{{Key: "revision", Value: -1}}).
+		SetSkip(int64(keep)).
+		SetProjection(bson.D{{Key: "revision", Value: 1}})).Decode(&newestPruned)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("contentstore: find versions to prune: %w", err)
+	}
+	filter := bson.D{{Key: "itemId", Value: itemID}, {Key: "revision", Value: bson.D{{Key: "$lte", Value: newestPruned.Revision}}}}
+	if _, err := coll.DeleteMany(ctx, filter); err != nil {
+		return fmt.Errorf("contentstore: prune versions: %w", err)
+	}
+	return nil
+}
+
+// DeleteVersions deletes item itemID's versions, or every version when itemID is empty.
+func (p *Persistor) DeleteVersions(ctx context.Context, itemID string) error {
+	coll, err := p.versionCollection()
+	if err != nil {
+		return err
+	}
+	filter := bson.D{}
+	if itemID != "" {
+		filter = bson.D{{Key: "itemId", Value: itemID}}
+	}
+	if _, err := coll.DeleteMany(ctx, filter); err != nil {
+		return fmt.Errorf("contentstore: delete versions: %w", err)
+	}
+	return nil
 }

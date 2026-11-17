@@ -98,12 +98,14 @@ func TestFieldUpdateDocumentClearsLocaleWithUnset(t *testing.T) {
 // TestFieldUpdateFilter verifies key matches upsert (create-or-update) while id-only
 // matches require an existing document.
 func TestFieldUpdateFilter(t *testing.T) {
-	if f, upsert := fieldUpdateFilter(ContentItemMatch{Key: "k"}); !upsert {
+	if f, upsert := fieldUpdateFilter(ContentItemMatch{Key: "k"}, testType); !upsert {
 		t.Fatalf("key match must upsert, got filter %#v", f)
 	} else if v, ok := lookup(f, "key"); !ok || v != "k" {
 		t.Fatalf("key filter wrong: %#v", f)
+	} else if v, ok := lookup(f, "type"); !ok || v != testType {
+		t.Fatalf("key filter must also match the type: %#v", f)
 	}
-	if f, upsert := fieldUpdateFilter(ContentItemMatch{ID: "i"}); upsert {
+	if f, upsert := fieldUpdateFilter(ContentItemMatch{ID: "i"}, testType); upsert {
 		t.Fatalf("id match must not upsert, got filter %#v", f)
 	} else if v, ok := lookup(f, "_id"); !ok || v != "i" {
 		t.Fatalf("id filter wrong: %#v", f)

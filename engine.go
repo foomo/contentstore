@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 )
 
@@ -31,11 +32,23 @@ type ContentStore interface {
 // error type).
 type Engine struct {
 	store   Store
+	tree    TreeStore // the store's tree capabilities; nil when it has none
+	tags    TagStore  // the store's tag capabilities; nil when it has none
 	schemas *Registry
 	locales LocaleConfig
 	newID   func() string
 	notify  Notifier
 	role    DeploymentRole
+
+	// schedules is the store's scheduled-action capabilities; nil when it has none or they
+	// are disabled.
+	schedules ScheduleStore
+	// execute runs due scheduled actions in place of the built-in operations when set.
+	execute ScheduleExecutor
+
+	// versions is the store's version capabilities; nil when it has none or they are
+	// disabled.
+	versions VersionStore
 }
 
 var _ ContentStore = (*Engine)(nil)
@@ -46,17 +59,30 @@ func New(d Deps) *Engine {
 	if role == "" {
 		role = DeploymentRoleCanonical
 	}
-	return &Engine{
+	tree, _ := d.Store.(TreeStore)
+	tags, _ := d.Store.(TagStore)
+	engine := &Engine{
 		store:   d.Store,
+		tree:    tree,
+		tags:    tags,
 		schemas: d.Schemas,
 		locales: d.Locales,
 		newID:   d.NewID,
 		notify:  d.Notify,
 		role:    role,
+		execute: d.ScheduleExecutor,
 	}
+	if schedules, ok := d.Store.(ScheduleStore); ok && schedules.SchedulesEnabled() {
+		engine.schedules = schedules
+	}
+	if versions, ok := d.Store.(VersionStore); ok && versions.VersionsEnabled() {
+		engine.versions = versions
+	}
+	return engine
 }
 
-// SaveDraft creates or updates an item's draft snapshot. It does not publish.
+// SaveDraft creates or updates an item's draft snapshot. It does not publish. Items of a
+// tree type are saved in a tree transaction (see saveTreeDraft).
 func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentItem, error) {
 	// A SaveDraft replaces the draft's entire field set. Guard against an omitted
 	// "fields" (nil) so a fields-less request cannot silently wipe an existing draft —
@@ -67,13 +93,67 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 	if input.ExpectedRevision != nil && *input.ExpectedRevision < 0 {
 		return nil, badRequest("expectedRevision must not be negative")
 	}
+	if input.ParentID != "" || input.Name != "" || e.schemas.isTreeType(input.Type) {
+		return e.saveTreeDraft(ctx, input)
+	}
 
-	item, err := e.resolveForSave(ctx, input)
+	item, created, err := e.resolveForSave(ctx, input)
 	if err != nil {
 		return nil, err
 	}
-	if err := e.validateDraft(item.Type, input.Fields); err != nil {
+	if e.onTree(item) {
+		return e.saveTreeDraft(ctx, input)
+	}
+	if !created && input.ExpectedRevision == nil && e.tagged(item) {
+		return e.saveTaggedDraft(ctx, input, item)
+	}
+	if err := e.saveDraft(ctx, item, input, input.ExpectedRevision); err != nil {
 		return nil, err
+	}
+	e.emit(item, OpSaveDraft)
+	return item, nil
+}
+
+// saveTaggedDraft is SaveDraft for an existing item that takes tags: the draft is replaced
+// only if its revision is still the loaded one, retrying from a fresh load otherwise, so
+// a concurrent targeted write (UpdateTags, SetFieldValue) is never overwritten.
+func (e *Engine) saveTaggedDraft(ctx context.Context, input SaveDraftInput, loaded *ContentItem) (*ContentItem, error) {
+	item, err := retryConflicts(func() (*ContentItem, bool, error) {
+		item := loaded
+		loaded = nil // later attempts reload
+		if item == nil {
+			var err error
+			if item, _, err = e.resolveForSave(ctx, input); err != nil {
+				return nil, false, err
+			}
+		}
+		var expected *int64
+		if item.Draft != nil {
+			expected = new(item.Draft.Revision)
+		}
+		err := e.saveDraft(ctx, item, input, expected)
+		if typed, ok := errors.AsType[*Error](err); ok && typed.Kind == KindConflict {
+			return nil, true, nil
+		}
+		return item, false, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	e.emit(item, OpSaveDraft)
+	return item, nil
+}
+
+// saveDraft validates input.Fields against the item's type and writes them as the item's
+// new draft snapshot, expecting the given stored draft revision (nil: unconditionally).
+func (e *Engine) saveDraft(ctx context.Context, item *ContentItem, input SaveDraftInput, expected *int64) error {
+	if err := e.validateDraft(item.Type, input.Fields); err != nil {
+		return err
+	}
+	if e.guardsDraftSize(item.Type) {
+		if err := validateDraftSize(input.Fields); err != nil {
+			return err
+		}
 	}
 
 	now := time.Now().UTC()
@@ -81,15 +161,18 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 
 	revision := int64(1)
 	createdAt := now
+	var tags TagSet // SaveDraft replaces the fields; tags only change through UpdateTags and MergeTags
 	if item.Draft != nil {
 		revision = item.Draft.Revision + 1
 		createdAt = item.Draft.CreatedAt
+		tags = item.Draft.Tags
 	}
 	item.Draft = &ContentSnapshot{
 		Revision:      revision,
 		SchemaVersion: schema.Version,
 		SchemaHash:    schema.Hash,
 		Fields:        input.Fields,
+		Tags:          tags,
 		CreatedAt:     createdAt,
 		UpdatedAt:     now,
 	}
@@ -98,14 +181,13 @@ func (e *Engine) SaveDraft(ctx context.Context, input SaveDraftInput) (*ContentI
 	}
 	item.UpdatedAt = now
 
-	if err := e.store.Upsert(ctx, item, input.ExpectedRevision); err != nil {
+	if err := e.store.Upsert(ctx, item, expected); err != nil {
 		if errors.Is(err, ErrConflict) {
-			return nil, conflict("draft revision conflict")
+			return conflict("draft revision conflict")
 		}
-		return nil, internalErr(err, "save draft failed")
+		return internalErr(err, "save draft failed")
 	}
-	e.emit(item, OpSaveDraft)
-	return item, nil
+	return nil
 }
 
 // SetFieldValue merges a single field/locale value into the item's draft, leaving other
@@ -120,17 +202,35 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 	// Resolve the (immutable) content type and enforce the create/update guards. This read
 	// is safe under concurrency — an item's type never changes — and the write below is a
 	// targeted atomic merge, so simultaneous per-field writes do not clobber each other.
-	contentType, err := e.fieldWriteType(ctx, input)
+	contentType, existing, err := e.fieldWriteType(ctx, input)
 	if err != nil {
 		return nil, err
+	}
+	match := input.Match
+	switch {
+	case existing == nil && e.schemas.isTreeType(contentType):
+		return nil, badRequest(fmt.Sprintf("items of tree type %q need a name: create them with SaveDraft", contentType))
+	case existing != nil && e.onTree(existing):
+		// Address a tree item by ID so the write can never upsert a replacement for an item
+		// deleted concurrently: tree items are only created with a name, by SaveDraft.
+		match = ContentItemMatch{ID: existing.ID}
 	}
 	if err := e.validateField(contentType, input.FieldID, input.Locale, input.Value); err != nil {
 		return nil, err
 	}
+	if e.guardsDraftSize(contentType) {
+		var draftFields ContentFields
+		if existing != nil && existing.Draft != nil {
+			draftFields = existing.Draft.Fields
+		}
+		if err := validateDraftSize(withFieldValue(draftFields, input.FieldID, input.Locale, input.Value)); err != nil {
+			return nil, err
+		}
+	}
 
 	schema, _ := e.schemas.schemaFor(contentType)
 	item, err := e.store.SetField(ctx, FieldUpdate{
-		Match:         input.Match,
+		Match:         match,
 		Type:          contentType,
 		OwnerRef:      input.OwnerRef,
 		FieldID:       input.FieldID,
@@ -145,6 +245,9 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 		if errors.Is(err, ErrNotFound) {
 			return nil, notFound("item not found")
 		}
+		if errors.Is(err, ErrConflict) {
+			return nil, conflict("key is taken by an item of another type")
+		}
 		return nil, internalErr(err, "set field value failed")
 	}
 	e.emit(item, OpSaveDraft)
@@ -152,51 +255,81 @@ func (e *Engine) SetFieldValue(ctx context.Context, input SetFieldValueInput) (*
 }
 
 // fieldWriteType resolves the content type a SetFieldValue writes against, enforcing that
-// an existing item's type is immutable and that a create carries a key + known type.
-func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (ContentType, error) {
+// an existing item's type is immutable and that a create carries a key + known type. It
+// also returns the existing item (nil on create).
+func (e *Engine) fieldWriteType(ctx context.Context, input SetFieldValueInput) (ContentType, *ContentItem, error) {
 	existing, err := e.resolveExisting(ctx, input.Match)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if existing != nil {
 		if err := rejectArchived(existing); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if input.Type != "" && input.Type != existing.Type {
-			return "", badRequest("item type cannot change")
+			return "", nil, badRequest("item type cannot change")
 		}
-		return existing.Type, nil
+		return existing.Type, existing, nil
 	}
 	if input.Match.Key == "" {
-		return "", badRequest("key is required to create a new item")
+		return "", nil, badRequest("key is required to create a new item")
 	}
 	if input.Type == "" {
-		return "", badRequest("type is required to create a new item")
+		return "", nil, badRequest("type is required to create a new item")
 	}
 	if _, ok := e.schemas.schemaFor(input.Type); !ok {
-		return "", badRequest(fmt.Sprintf("unknown content type %q", input.Type))
+		return "", nil, badRequest(fmt.Sprintf("unknown content type %q", input.Type))
 	}
-	return input.Type, nil
+	return input.Type, nil, nil
 }
 
-// Publish copies the current draft snapshot into the published snapshot.
+// Publish copies the current draft snapshot into the published snapshot. For a type with a
+// VersionPolicy it records the published snapshot as a version (see ContentVersions), in
+// the same transaction for tree items. For other items it records it right after; if that
+// fails, the item is published (and emits OpPublish) but Publish returns the error, and
+// publishing again records the version.
 func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
+	var replaced *ContentSnapshot // the published snapshot the publish replaces
+	item, _, err := e.writeThen(ctx, match, "publish failed", func(ctx context.Context, item *ContentItem) (bool, error) {
+		if err := e.requireVersionsFor(item.Type); err != nil {
+			return false, err
+		}
+		replaced = item.Published
+		return e.publish(ctx, item)
+	}, func(ctx context.Context, item *ContentItem) error {
+		return e.recordVersions(ctx, item, replaced)
+	})
+	if item == nil {
+		return nil, err
+	}
+	e.emit(item, OpPublish)
 	if err != nil {
 		return nil, err
 	}
+	return item, nil
+}
+
+func (e *Engine) publish(_ context.Context, item *ContentItem) (bool, error) {
 	if err := rejectArchived(item); err != nil {
-		return nil, err
+		return false, err
 	}
 	if item.Draft == nil {
-		return nil, notAcceptable("nothing to publish: item has no draft")
+		return false, notAcceptable("nothing to publish: item has no draft")
 	}
 	if err := e.validatePublish(item.Type, item.Draft.Fields); err != nil {
-		return nil, err
+		return false, err
+	}
+	// Concurrent SetFieldValue calls are checked against the draft each one read, so
+	// together they can outgrow the guard; publishing would then exceed the document size.
+	if e.guardsDraftSize(item.Type) {
+		if err := validateDraftSize(item.Draft.Fields); err != nil {
+			return false, err
+		}
 	}
 
 	now := time.Now().UTC()
 	published := *item.Draft // published revision equals the draft revision → Published state
+	published.Tags = maps.Clone(item.Draft.Tags)
 	published.UpdatedAt = now
 	if item.Published != nil {
 		published.CreatedAt = item.Published.CreatedAt
@@ -205,39 +338,38 @@ func (e *Engine) Publish(ctx context.Context, match ContentItemMatch) (*ContentI
 	}
 	item.Published = &published
 	item.UpdatedAt = now
-
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return nil, internalErr(err, "publish failed")
-	}
-	e.emit(item, OpPublish)
-	return item, nil
+	return true, nil
 }
 
 // Unpublish drops the published snapshot, returning the item to Draft while keeping the
 // working draft. Unlike Unarchive it leaves ArchivedAt untouched, so it is the plain
 // "take it off the live site" counterpart to Publish. An item that is not published is
 // left alone (and emits nothing) rather than rejected, so bulk callers can apply it to a
-// mixed selection.
+// mixed selection. Unpublishing a tree container hides its subtree from the published view.
 func (e *Engine) Unpublish(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
+	item, changed, err := e.write(ctx, match, "unpublish failed", e.unpublish)
 	if err != nil {
 		return nil, err
 	}
+	if changed {
+		e.emit(item, OpUnpublish)
+	}
+	return item, nil
+}
+
+// unpublish drops the item's published snapshot, reporting whether there was one. The
+// write replaces the whole document: a partial $set could not clear the omitempty
+// published field (see Unarchive and archive_integration_test.go).
+func (e *Engine) unpublish(_ context.Context, item *ContentItem) (bool, error) {
 	if err := rejectArchived(item); err != nil {
-		return nil, err
+		return false, err
 	}
 	if item.Published == nil {
-		return item, nil
+		return false, nil
 	}
 	item.Published = nil
 	item.UpdatedAt = time.Now().UTC()
-	// Upsert replaces the whole document; a partial $set could not clear the omitempty
-	// published field (see Unarchive and archive_integration_test.go).
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return nil, internalErr(err, "unpublish failed")
-	}
-	e.emit(item, OpUnpublish)
-	return item, nil
+	return true, nil
 }
 
 // rejectArchived blocks the write operations an archived item must not accept. Archiving
@@ -251,17 +383,22 @@ func rejectArchived(item *ContentItem) error {
 	return nil
 }
 
-// Archive hides an item while keeping both snapshots.
+// Archive hides an item while keeping both snapshots. A tree item can only be archived
+// once all its children are.
 func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
+	item, _, err := e.write(ctx, match, "archive failed", func(ctx context.Context, item *ContentItem) (bool, error) {
+		if e.onTree(item) {
+			if err := e.rejectChildren(ctx, item, LifecycleLive, "archive its children first"); err != nil {
+				return false, err
+			}
+		}
+		now := time.Now().UTC()
+		item.ArchivedAt = &now
+		item.UpdatedAt = now
+		return true, nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	now := time.Now().UTC()
-	item.ArchivedAt = &now
-	item.UpdatedAt = now
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return nil, internalErr(err, "archive failed")
 	}
 	e.emit(item, OpArchive)
 	return item, nil
@@ -270,23 +407,30 @@ func (e *Engine) Archive(ctx context.Context, match ContentItemMatch) (*ContentI
 // Unarchive restores an archived item to Draft. It drops the published snapshot: a
 // previously-published item is NOT re-published automatically (symmetric to Contentful,
 // where archived entries are never published). The working draft is preserved, so no
-// content is lost; re-publish to make it live again.
+// content is lost; re-publish to make it live again. A tree item can only be unarchived
+// while its parent is not archived.
 func (e *Engine) Unarchive(ctx context.Context, match ContentItemMatch) (*ContentItem, error) {
-	item, err := e.loadByMatch(ctx, match)
+	item, _, err := e.write(ctx, match, "unarchive failed", func(ctx context.Context, item *ContentItem) (bool, error) {
+		if e.onTree(item) {
+			if err := e.rejectArchivedParent(ctx, item); err != nil {
+				return false, err
+			}
+		}
+		item.ArchivedAt = nil
+		item.Published = nil
+		item.UpdatedAt = time.Now().UTC()
+		return true, nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	item.ArchivedAt = nil
-	item.Published = nil
-	item.UpdatedAt = time.Now().UTC()
-	if err := e.store.Upsert(ctx, item, nil); err != nil {
-		return nil, internalErr(err, "unarchive failed")
 	}
 	e.emit(item, OpUnarchive)
 	return item, nil
 }
 
-// Delete hard-deletes an item. Deleting a missing item is idempotent (returns false).
+// Delete hard-deletes an item, its scheduled actions and its versions. Deleting a missing
+// item is idempotent (returns false). A tree item can only be deleted once it has no
+// children, archived ones included.
 func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, error) {
 	if match.ID == "" && match.Key == "" {
 		return false, badRequest("delete requires a non-empty match (id or key)")
@@ -298,9 +442,19 @@ func (e *Engine) Delete(ctx context.Context, match ContentItemMatch) (bool, erro
 	if item == nil {
 		return false, nil
 	}
+	if e.onTree(item) {
+		deleted, err := e.deleteTreeItem(ctx, match)
+		if deleted {
+			e.dropScheduledActions(ctx, item.ID)
+			e.dropVersions(ctx, item.ID)
+		}
+		return deleted, err
+	}
 	if err := e.store.Delete(ctx, item.ID); err != nil {
 		return false, internalErr(err, "delete failed")
 	}
+	e.dropScheduledActions(ctx, item.ID)
+	e.dropVersions(ctx, item.ID)
 	e.emit(item, OpDelete)
 	return true, nil
 }
@@ -314,7 +468,7 @@ func (e *Engine) emit(item *ContentItem, op string) {
 	if s, ok := e.schemas.schemaFor(item.Type); ok && s.SuppressChangeEvents {
 		return
 	}
-	e.notify(ContentChange{Type: item.Type, OwnerRef: item.OwnerRef, Op: op})
+	e.notify(ContentChange{Type: item.Type, OwnerRef: item.OwnerRef, Op: op, ID: item.ID, Key: item.Key})
 }
 
 // GetItem returns a single item by match.
@@ -326,6 +480,9 @@ func (e *Engine) GetItem(ctx context.Context, match ContentItemMatch) (*ContentI
 // reads never expose working drafts; preview reads expose the latest draft and
 // derived lifecycle state.
 func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input SnapshotInput) (*Snapshot, error) {
+	if err := input.Tags.validate(); err != nil {
+		return nil, err
+	}
 	var (
 		items []*ContentItem
 		err   error
@@ -342,44 +499,65 @@ func (e *Engine) GetSnapshot(ctx context.Context, view SnapshotView, input Snaps
 		return nil, internalErr(err, "snapshot read failed")
 	}
 
-	snapshot := &Snapshot{CreatedAt: time.Now().UTC(), Items: make([]SnapshotItem, 0, len(items))}
-	for _, item := range items {
-		var (
-			fields    ContentFields
-			state     string
-			updatedAt time.Time
-		)
-		switch view {
-		case SnapshotViewPublished:
-			if item.Published == nil { // defensive; FindPublished already filters these out
-				continue
-			}
-			fields = item.Published.Fields
-			state = StatePublished
-			updatedAt = item.Published.UpdatedAt
-		case SnapshotViewPreview:
-			if item.Draft == nil { // defensive; a non-archived item always has a draft
-				continue
-			}
-			fields = item.Draft.Fields
-			state = item.State()
-			updatedAt = item.UpdatedAt
-		}
-
-		snapshot.Items = append(snapshot.Items, SnapshotItem{
-			ID:        item.ID,
-			Key:       item.Key,
-			Type:      item.Type,
-			OwnerRef:  item.OwnerRef,
-			State:     state,
-			Fields:    fields,
-			UpdatedAt: updatedAt,
-		})
-		if revision := updatedAt.UnixNano(); revision > snapshot.Revision {
-			snapshot.Revision = revision
+	if view == SnapshotViewPublished {
+		// Placed items are visible only while every ancestor is published too.
+		if items, err = e.withPublishedAncestors(ctx, items); err != nil {
+			return nil, internalErr(err, "snapshot read failed")
 		}
 	}
+
+	snapshot := &Snapshot{CreatedAt: time.Now().UTC(), Items: make([]SnapshotItem, 0, len(items))}
+	for _, item := range items {
+		// Defensive skip: FindPublished only returns published items and a non-archived
+		// item always has a draft.
+		snapshotItem, ok := toSnapshotItem(view, item)
+		if !ok {
+			continue
+		}
+		// The revision covers the items before tag filtering, so an item that stops
+		// matching the filter still changes it.
+		if revision := snapshotItem.UpdatedAt.UnixNano(); revision > snapshot.Revision {
+			snapshot.Revision = revision
+		}
+		if !input.Tags.matches(snapshotItem.Tags) {
+			continue
+		}
+		snapshot.Items = append(snapshot.Items, snapshotItem)
+	}
 	return snapshot, nil
+}
+
+// toSnapshotItem returns item's representation in view, or false when it has none.
+func toSnapshotItem(view SnapshotView, item *ContentItem) (SnapshotItem, bool) {
+	out := SnapshotItem{
+		ID:       item.ID,
+		Key:      item.Key,
+		Type:     item.Type,
+		OwnerRef: item.OwnerRef,
+		ParentID: item.ParentID,
+		Name:     item.Name,
+	}
+	switch view {
+	case SnapshotViewPublished:
+		if item.Published == nil {
+			return SnapshotItem{}, false
+		}
+		out.Fields = item.Published.Fields
+		out.Tags = item.Published.Tags
+		out.State = StatePublished
+		out.UpdatedAt = item.Published.UpdatedAt
+	case SnapshotViewPreview:
+		if item.Draft == nil {
+			return SnapshotItem{}, false
+		}
+		out.Fields = item.Draft.Fields
+		out.Tags = item.Draft.Tags
+		out.State = item.State()
+		out.UpdatedAt = item.UpdatedAt
+	default:
+		return SnapshotItem{}, false
+	}
+	return out, true
 }
 
 // GetArchivedSnapshot returns all archived content, optionally narrowed by type — the
@@ -401,7 +579,10 @@ func (e *Engine) GetArchivedSnapshot(ctx context.Context, input ArchivedSnapshot
 			Key:        item.Key,
 			Type:       item.Type,
 			OwnerRef:   item.OwnerRef,
+			ParentID:   item.ParentID,
+			Name:       item.Name,
 			Fields:     item.Draft.Fields,
+			Tags:       item.Draft.Tags,
 			ArchivedAt: *item.ArchivedAt,
 			UpdatedAt:  item.UpdatedAt,
 		})
@@ -418,31 +599,32 @@ func (e *Engine) GetSchemas(_ context.Context) (*SchemasResult, error) {
 	return &SchemasResult{Schemas: e.schemas.all()}, nil
 }
 
-// resolveForSave resolves the item to update, or builds a new one to create.
-func (e *Engine) resolveForSave(ctx context.Context, input SaveDraftInput) (*ContentItem, error) {
+// resolveForSave resolves the item to update, or builds a new one to create (reported by
+// the created result).
+func (e *Engine) resolveForSave(ctx context.Context, input SaveDraftInput) (*ContentItem, bool, error) {
 	existing, err := e.resolveExisting(ctx, input.Match)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if existing != nil {
 		if err := rejectArchived(existing); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if input.Type != "" && input.Type != existing.Type {
-			return nil, badRequest("item type cannot change")
+			return nil, false, badRequest("item type cannot change")
 		}
 		if existing.Key == "" && input.Match.Key != "" {
 			existing.Key = input.Match.Key
 		}
-		return existing, nil
+		return existing, false, nil
 	}
 
 	// Create.
 	if input.Type == "" {
-		return nil, badRequest("type is required to create a new item")
+		return nil, false, badRequest("type is required to create a new item")
 	}
 	if _, ok := e.schemas.schemaFor(input.Type); !ok {
-		return nil, badRequest(fmt.Sprintf("unknown content type %q", input.Type))
+		return nil, false, badRequest(fmt.Sprintf("unknown content type %q", input.Type))
 	}
 	now := time.Now().UTC()
 	return &ContentItem{
@@ -452,7 +634,7 @@ func (e *Engine) resolveForSave(ctx context.Context, input SaveDraftInput) (*Con
 		OwnerRef:  input.OwnerRef,
 		CreatedAt: now,
 		UpdatedAt: now,
-	}, nil
+	}, true, nil
 }
 
 // resolveExisting loads the item addressed by a match for an update. An ID that does not

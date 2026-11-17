@@ -3,7 +3,10 @@ package contentstore
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // validateDraft checks a draft's structure, field types/sizes, and locale usage. It does
@@ -76,6 +79,42 @@ func (e *Engine) validatePublish(t ContentType, fields ContentFields) error {
 	return nil
 }
 
+// guardsDraftSize reports whether drafts of type t are size-checked: only types that
+// override a field's MaxLength can grow large enough to need it.
+func (e *Engine) guardsDraftSize(t ContentType) bool {
+	schema, ok := e.schemas.schemaFor(t)
+	return ok && schema.hasMaxLength()
+}
+
+// validateDraftSize rejects draft fields that would not fit one stored document together
+// with their published copy. Values that cannot be BSON-encoded are left to the store.
+func validateDraftSize(fields ContentFields) error {
+	if b, err := bson.Marshal(fields); err == nil && len(b) > maxDraftFieldsBytes {
+		return badRequest(fmt.Sprintf("draft fields exceed %d bytes", maxDraftFieldsBytes))
+	}
+	return nil
+}
+
+// withFieldValue returns fields with fieldID/locale set to value (cleared when nil),
+// copying only what it changes.
+func withFieldValue(fields ContentFields, fieldID, locale string, value FieldValue) ContentFields {
+	out := maps.Clone(fields)
+	if out == nil {
+		out = ContentFields{}
+	}
+	byLocale := maps.Clone(out[fieldID])
+	if byLocale == nil {
+		byLocale = LocalizedFieldValues{}
+	}
+	if value == nil {
+		delete(byLocale, locale)
+	} else {
+		byLocale[locale] = value
+	}
+	out[fieldID] = byLocale
+	return out
+}
+
 // validateValue enforces the field type and size limit for a single locale value. A nil
 // value clears the locale and is always allowed.
 func validateValue(fd FieldDefinition, value FieldValue) error {
@@ -88,7 +127,7 @@ func validateValue(fd FieldDefinition, value FieldValue) error {
 		if !ok {
 			return fmt.Errorf("expected a string")
 		}
-		if limit := fieldLimit(fd.Type); len(s) > limit {
+		if limit := fd.limit(); len(s) > limit {
 			return fmt.Errorf("exceeds %d characters", limit)
 		}
 	case FieldTypeInteger:
@@ -103,7 +142,7 @@ func validateValue(fd FieldDefinition, value FieldValue) error {
 		if err != nil {
 			return fmt.Errorf("not serializable: %w", err)
 		}
-		if limit := fieldLimit(fd.Type); len(b) > limit {
+		if limit := fd.limit(); len(b) > limit {
 			return fmt.Errorf("serialized value exceeds %d characters", limit)
 		}
 	default:
